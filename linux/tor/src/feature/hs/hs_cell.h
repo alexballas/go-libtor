@@ -11,6 +11,7 @@
 
 #include "core/or/or.h"
 #include "feature/hs/hs_service.h"
+#include "feature/hs/hs_pow.h"
 
 /** An INTRODUCE1 cell requires at least this amount of bytes (see section
  * 3.2.2 of the specification). Below this value, the cell must be padded. */
@@ -40,7 +41,28 @@ typedef struct hs_cell_introduce1_data_t {
   const curve25519_keypair_t *client_kp;
   /** Rendezvous point link specifiers. */
   smartlist_t *link_specifiers;
+  /** Congestion control parameters. */
+  unsigned int cc_enabled : 1;
+  /** PoW solution (Can be NULL if disabled). */
+  const hs_pow_solution_t *pow_solution;
 } hs_cell_introduce1_data_t;
+
+/** Introduction data needed to launch a rendezvous circuit. This is set after
+ * receiving an INTRODUCE2 valid cell. */
+typedef struct hs_cell_intro_rdv_data_t {
+  /** Onion public key computed using the INTRODUCE2 encrypted section. */
+  curve25519_public_key_t onion_pk;
+  /** Rendezvous cookie taken from the INTRODUCE2 encrypted section. */
+  uint8_t rendezvous_cookie[REND_COOKIE_LEN];
+  /** Client public key from the INTRODUCE2 encrypted section. */
+  curve25519_public_key_t client_pk;
+  /** Link specifiers of the rendezvous point. Contains link_specifier_t. */
+  smartlist_t *link_specifiers;
+  /** Congestion control parameters. */
+  unsigned int cc_enabled : 1;
+  /** PoW effort. */
+  uint32_t pow_effort;
+} hs_cell_intro_rdv_data_t;
 
 /** This data structure contains data that we need to parse an INTRODUCE2 cell
  * which is used by the INTRODUCE2 cell parsing function. On a successful
@@ -72,16 +94,12 @@ typedef struct hs_cell_introduce2_data_t {
 
   /*** Mutable Section: Set upon parsing INTRODUCE2 cell. ***/
 
-  /** Onion public key computed using the INTRODUCE2 encrypted section. */
-  curve25519_public_key_t onion_pk;
-  /** Rendezvous cookie taken from the INTRODUCE2 encrypted section. */
-  uint8_t rendezvous_cookie[REND_COOKIE_LEN];
-  /** Client public key from the INTRODUCE2 encrypted section. */
-  curve25519_public_key_t client_pk;
-  /** Link specifiers of the rendezvous point. Contains link_specifier_t. */
-  smartlist_t *link_specifiers;
+  /** Data needed to launch a rendezvous circuit. */
+  hs_cell_intro_rdv_data_t rdv_data;
   /** Replay cache of the introduction point. */
   replaycache_t *replay_cache;
+  /** Flow control negotiation parameters. */
+  protover_summary_flags_t pv;
 } hs_cell_introduce2_data_t;
 
 /* Build cell API. */
@@ -104,7 +122,8 @@ ssize_t hs_cell_parse_intro_established(const uint8_t *payload,
                                         size_t payload_len);
 ssize_t hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
                                  const origin_circuit_t *circ,
-                                 const hs_service_t *service);
+                                 const hs_service_t *service,
+                                 const hs_service_intro_point_t *ip);
 int hs_cell_parse_introduce_ack(const uint8_t *payload, size_t payload_len);
 int hs_cell_parse_rendezvous2(const uint8_t *payload, size_t payload_len,
                               uint8_t *handshake_info,
@@ -115,9 +134,9 @@ void hs_cell_introduce1_data_clear(hs_cell_introduce1_data_t *data);
 
 #ifdef TOR_UNIT_TESTS
 
-#include "trunnel/hs/cell_common.h"
+#include "trunnel/extension.h"
 
-STATIC trn_cell_extension_t *
+STATIC trn_extension_t *
 build_establish_intro_extensions(const hs_service_config_t *service_config,
                                  const hs_service_intro_point_t *ip);
 

@@ -26,11 +26,9 @@ struct or_connection_t {
    * if the other side hasn't shown us a valid identity key. */
   char identity_digest[DIGEST_LEN];
 
-  /** Extended ORPort connection identifier. */
-  char *ext_or_conn_id;
   /** This is the ClientHash value we expect to receive from the
    *  client during the Extended ORPort authentication protocol. We
-   *  compute it upon receiving the ClientNoce from the client, and we
+   *  compute it upon receiving the ClientNonce from the client, and we
    *  compare it with the actual ClientHash value sent by the
    *  client. */
   char *ext_or_auth_correct_client_hash;

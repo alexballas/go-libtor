@@ -62,8 +62,11 @@
 #include "core/or/circuituse.h"
 #include "core/or/circuitstats.h"
 #include "core/or/circuitpadding.h"
+#include "core/or/conflux.h"
+#include "core/or/conflux_pool.h"
 #include "core/or/crypt_path.h"
 #include "core/or/extendinfo.h"
+#include "core/or/status.h"
 #include "core/or/trace_probes_circuit.h"
 #include "core/mainloop/connection.h"
 #include "app/config/config.h"
@@ -100,6 +103,9 @@
 #include "lib/compress/compress_zlib.h"
 #include "lib/compress/compress_zstd.h"
 #include "lib/buf/buffers.h"
+#include "core/or/congestion_control_common.h"
+#include "core/or/congestion_control_st.h"
+#include "lib/math/stats.h"
 
 #include "core/or/ocirc_event.h"
 
@@ -114,6 +120,7 @@
 #include "core/or/or_circuit_st.h"
 #include "core/or/origin_circuit_st.h"
 
+#include "core/or/conflux_util.h"
 /********* START VARIABLES **********/
 
 /** A global list of all circuits at this hop. */
@@ -144,6 +151,13 @@ static void circuit_about_to_free(circuit_t *circ);
  * circuit_expire_building). 0 otherwise.
  */
 static int any_opened_circs_cached_val = 0;
+
+/** Moving average of the cc->cwnd from each closed circuit. */
+double cc_stats_circ_close_cwnd_ma = 0;
+/** Moving average of the cc->cwnd from each closed slow-start circuit. */
+double cc_stats_circ_close_ss_cwnd_ma = 0;
+
+uint64_t cc_stats_circs_closed = 0;
 
 /********* END VARIABLES ************/
 
@@ -830,6 +844,11 @@ circuit_purpose_to_controller_string(uint8_t purpose)
     case CIRCUIT_PURPOSE_C_CIRCUIT_PADDING:
       return "CIRCUIT_PADDING";
 
+    case CIRCUIT_PURPOSE_CONFLUX_UNLINKED:
+      return "CONFLUX_UNLINKED";
+    case CIRCUIT_PURPOSE_CONFLUX_LINKED:
+      return "CONFLUX_LINKED";
+
     default:
       tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
       return buf;
@@ -859,6 +878,8 @@ circuit_purpose_to_controller_hs_state_string(uint8_t purpose)
     case CIRCUIT_PURPOSE_PATH_BIAS_TESTING:
     case CIRCUIT_PURPOSE_HS_VANGUARDS:
     case CIRCUIT_PURPOSE_C_CIRCUIT_PADDING:
+    case CIRCUIT_PURPOSE_CONFLUX_UNLINKED:
+    case CIRCUIT_PURPOSE_CONFLUX_LINKED:
       return NULL;
 
     case CIRCUIT_PURPOSE_INTRO_POINT:
@@ -961,6 +982,12 @@ circuit_purpose_to_string(uint8_t purpose)
 
     case CIRCUIT_PURPOSE_C_CIRCUIT_PADDING:
       return "Circuit kept open for padding";
+
+    case CIRCUIT_PURPOSE_CONFLUX_UNLINKED:
+      return "Unlinked conflux circuit";
+
+    case CIRCUIT_PURPOSE_CONFLUX_LINKED:
+      return "Linked conflux circuit";
 
     default:
       tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
@@ -1142,6 +1169,8 @@ circuit_free_(circuit_t *circ)
    * circuits without closing them before. This needs to be done before the
    * hs identifier is freed. */
   hs_circ_cleanup_on_free(circ);
+
+  congestion_control_free(circ->ccontrol);
 
   if (CIRCUIT_IS_ORIGIN(circ)) {
     origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
@@ -1828,6 +1857,9 @@ get_circuit_purpose_needed_to_cannibalize(uint8_t purpose)
      * circuits so that we get the same path construction logic. */
     return CIRCUIT_PURPOSE_HS_VANGUARDS;
   } else {
+    /* Conflux purposes should never get here */
+    tor_assert_nonfatal(purpose != CIRCUIT_PURPOSE_CONFLUX_UNLINKED &&
+                        purpose != CIRCUIT_PURPOSE_CONFLUX_LINKED);
     /* If no vanguards are used just get a general circuit! */
     return CIRCUIT_PURPOSE_C_GENERAL;
   }
@@ -1872,6 +1904,10 @@ circuit_find_to_cannibalize(uint8_t purpose_to_produce, extend_info_t *info,
 
   tor_assert_nonfatal(purpose_to_search_for == CIRCUIT_PURPOSE_C_GENERAL ||
                       purpose_to_search_for == CIRCUIT_PURPOSE_HS_VANGUARDS);
+
+  tor_assert_nonfatal(purpose_to_search_for !=
+                      CIRCUIT_PURPOSE_CONFLUX_UNLINKED);
+  tor_assert_nonfatal(purpose_to_produce != CIRCUIT_PURPOSE_CONFLUX_UNLINKED);
 
   log_debug(LD_CIRC,
             "Hunting for a circ to cannibalize: purpose %d, uptime %d, "
@@ -2221,6 +2257,31 @@ circuit_mark_for_close_, (circuit_t *circ, int reason, int line,
   /* Notify the HS subsystem that this circuit is closing. */
   hs_circ_cleanup_on_close(circ);
 
+  /* Specific actions if this is a conflux related circuit. */
+  if (CIRCUIT_IS_CONFLUX(circ)) {
+    conflux_circuit_has_closed(circ);
+  }
+
+  /* Update stats. */
+  if (circ->ccontrol) {
+    if (circ->ccontrol->in_slow_start) {
+      /* If we are in slow start, only count the ss cwnd if we've sent
+       * enough data to get RTT measurements such that we have a min
+       * and a max RTT, and they are not the same. This prevents us from
+       * averaging and reporting unused and low-use circuits here */
+      if (circ->ccontrol->max_rtt_usec != circ->ccontrol->min_rtt_usec) {
+        cc_stats_circ_close_ss_cwnd_ma =
+          stats_update_running_avg(cc_stats_circ_close_ss_cwnd_ma,
+                                   circ->ccontrol->cwnd);
+      }
+    } else {
+      cc_stats_circ_close_cwnd_ma =
+        stats_update_running_avg(cc_stats_circ_close_cwnd_ma,
+                                 circ->ccontrol->cwnd);
+    }
+    cc_stats_circs_closed++;
+  }
+
   if (circuits_pending_close == NULL)
     circuits_pending_close = smartlist_new();
 
@@ -2244,6 +2305,8 @@ circuit_mark_for_close_, (circuit_t *circ, int reason, int line,
 static void
 circuit_about_to_free_atexit(circuit_t *circ)
 {
+  /* Cleanup conflux specifics. */
+  conflux_circuit_about_to_free(circ);
 
   if (circ->n_chan) {
     circuit_clear_cell_queue(circ, circ->n_chan);
@@ -2272,6 +2335,9 @@ circuit_about_to_free(circuit_t *circ)
 
   int reason = circ->marked_for_close_reason;
   int orig_reason = circ->marked_for_close_orig_reason;
+
+  /* Cleanup conflux specifics. */
+  conflux_circuit_about_to_free(circ);
 
   if (circ->state == CIRCUIT_STATE_ONIONSKIN_PENDING) {
     onion_pending_remove(TO_OR_CIRCUIT(circ));
@@ -2315,6 +2381,7 @@ circuit_about_to_free(circuit_t *circ)
   if (! CIRCUIT_IS_ORIGIN(circ)) {
     or_circuit_t *or_circ = TO_OR_CIRCUIT(circ);
     edge_connection_t *conn;
+
     for (conn=or_circ->n_streams; conn; conn=conn->next_stream)
       connection_edge_destroy(or_circ->p_circ_id, conn);
     or_circ->n_streams = NULL;
@@ -2342,6 +2409,12 @@ circuit_about_to_free(circuit_t *circ)
       }
       circuitmux_detach_circuit(or_circ->p_chan->cmux, circ);
       circuit_set_p_circid_chan(or_circ, 0, NULL);
+    }
+
+    if (or_circ->n_cells_discarded_at_end) {
+      time_t age = approx_time() - circ->timestamp_created.tv_sec;
+      note_circ_closed_for_unrecognized_cells(
+                      age, or_circ->n_cells_discarded_at_end);
     }
   } else {
     origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
@@ -2586,8 +2659,10 @@ conns_compare_by_buffer_age_(const void **a_, const void **b_)
 
 /** We're out of memory for cells, having allocated <b>current_allocation</b>
  * bytes' worth.  Kill the 'worst' circuits until we're under
- * FRACTION_OF_DATA_TO_RETAIN_ON_OOM of our maximum usage. */
-void
+ * FRACTION_OF_DATA_TO_RETAIN_ON_OOM of our maximum usage.
+ *
+ * Return the number of bytes removed. */
+size_t
 circuits_handle_oom(size_t current_allocation)
 {
   smartlist_t *circlist;
@@ -2597,6 +2672,7 @@ circuits_handle_oom(size_t current_allocation)
   size_t mem_recovered=0;
   int n_circuits_killed=0;
   int n_dirconns_killed=0;
+  int n_edgeconns_killed = 0;
   uint32_t now_ts;
   log_notice(LD_GENERAL, "We're low on memory (cell queues total alloc:"
              " %"TOR_PRIuSZ" buffer total alloc: %" TOR_PRIuSZ ","
@@ -2613,12 +2689,11 @@ circuits_handle_oom(size_t current_allocation)
              tor_zstd_get_total_allocation(),
              tor_lzma_get_total_allocation(),
              hs_cache_get_total_allocation());
-
   {
     size_t mem_target = (size_t)(get_options()->MaxMemInQueues *
                                  FRACTION_OF_DATA_TO_RETAIN_ON_OOM);
     if (current_allocation <= mem_target)
-      return;
+      return 0;
     mem_to_recover = current_allocation - mem_target;
   }
 
@@ -2664,12 +2739,19 @@ circuits_handle_oom(size_t current_allocation)
       if (conn_age < circ->age_tmp) {
         break;
       }
-      if (conn->type == CONN_TYPE_DIR && conn->linked_conn == NULL) {
+      /* Also consider edge connections so we don't accumulate bytes on the
+       * outbuf due to a malicious destination holding off the read on us. */
+      if ((conn->type == CONN_TYPE_DIR && conn->linked_conn == NULL) ||
+          CONN_IS_EDGE(conn)) {
         if (!conn->marked_for_close)
           connection_mark_for_close(conn);
         mem_recovered += single_conn_free_bytes(conn);
 
-        ++n_dirconns_killed;
+        if (conn->type == CONN_TYPE_DIR) {
+          ++n_dirconns_killed;
+        } else {
+          ++n_edgeconns_killed;
+        }
 
         if (mem_recovered >= mem_to_recover)
           goto done_recovering_mem;
@@ -2691,20 +2773,23 @@ circuits_handle_oom(size_t current_allocation)
     mem_recovered += n * packed_cell_mem_cost();
     mem_recovered += half_stream_alloc;
     mem_recovered += freed;
+    mem_recovered += conflux_get_circ_bytes_allocation(circ);
 
     if (mem_recovered >= mem_to_recover)
       goto done_recovering_mem;
   } SMARTLIST_FOREACH_END(circ);
 
  done_recovering_mem:
-
   log_notice(LD_GENERAL, "Removed %"TOR_PRIuSZ" bytes by killing %d circuits; "
              "%d circuits remain alive. Also killed %d non-linked directory "
-             "connections.",
+             "connections. Killed %d edge connections",
              mem_recovered,
              n_circuits_killed,
              smartlist_len(circlist) - n_circuits_killed,
-             n_dirconns_killed);
+             n_dirconns_killed,
+             n_edgeconns_killed);
+
+  return mem_recovered;
 }
 
 /** Verify that circuit <b>c</b> has all of its invariants
@@ -2780,4 +2865,28 @@ assert_circuit_ok,(const circuit_t *c))
   } else {
     tor_assert(!or_circ || !or_circ->rend_splice);
   }
+}
+
+/** Return true iff the circuit queue for the given direction is full that is
+ * above the high watermark. */
+bool
+circuit_is_queue_full(const circuit_t *circ, cell_direction_t direction)
+{
+  int queue_size;
+
+  tor_assert(circ);
+
+  /* Gather objects we need based on cell direction. */
+  if (direction == CELL_DIRECTION_OUT) {
+    /* Outbound. */
+    queue_size = circ->n_chan_cells.n;
+  } else {
+    /* Inbound. */
+    queue_size = CONST_TO_OR_CIRCUIT(circ)->p_chan_cells.n;
+  }
+
+  /* Then check if our cell queue has reached its high watermark as in its
+   * upper limit. This is so we avoid too much memory pressure by queuing a
+   * large amount of cells. */
+  return queue_size >= cell_queue_highwatermark();
 }

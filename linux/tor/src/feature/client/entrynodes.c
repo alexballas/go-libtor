@@ -126,12 +126,14 @@
 #include "core/or/circuitlist.h"
 #include "core/or/circuitstats.h"
 #include "core/or/circuituse.h"
+#include "core/or/conflux_pool.h"
 #include "core/or/policies.h"
 #include "feature/client/bridges.h"
 #include "feature/client/circpathbias.h"
 #include "feature/client/entrynodes.h"
 #include "feature/client/transports.h"
 #include "feature/control/control_events.h"
+#include "feature/dirclient/dlstatus.h"
 #include "feature/dircommon/directory.h"
 #include "feature/nodelist/describe.h"
 #include "feature/nodelist/microdesc.h"
@@ -149,6 +151,9 @@
 #include "feature/nodelist/node_st.h"
 #include "core/or/origin_circuit_st.h"
 #include "app/config/or_state_st.h"
+#include "src/feature/nodelist/routerstatus_st.h"
+
+#include "core/or/conflux_util.h"
 
 /** A list of existing guard selection contexts. */
 static smartlist_t *guard_contexts = NULL;
@@ -559,7 +564,7 @@ get_extreme_restriction_threshold(void)
   int32_t pct = networkstatus_get_param(NULL,
                                         "guard-extreme-restriction-percent",
                                         DFLT_EXTREME_RESTRICTION_PERCENT,
-                                        1, INT32_MAX);
+                                        1, 100);
   return pct / 100.0;
 }
 
@@ -576,6 +581,18 @@ mark_guard_maybe_reachable(entry_guard_t *guard)
   guard->is_reachable = GUARD_REACHABLE_MAYBE;
   if (guard->is_filtered_guard)
     guard->is_usable_filtered_guard = 1;
+
+  /* Check if it is a bridge and we don't have its descriptor yet */
+  if (guard->bridge_addr && !guard_has_descriptor(guard)) {
+    /* Reset the descriptor fetch retry schedule, so it gives it another
+     * go soon. It's important to keep any "REACHABLE_MAYBE" bridges in
+     * sync with the descriptor fetch schedule, since we will refuse to
+     * use the network until our first primary bridges are either
+     * known-usable or known-unusable. See bug 40396. */
+    download_status_t *dl = get_bridge_dl_status_by_id(guard->identity);
+    if (dl)
+      download_status_reset(dl);
+  }
 }
 
 /**
@@ -597,7 +614,7 @@ mark_primary_guards_maybe_reachable(guard_selection_t *gs)
 }
 
 /* Called when we exhaust all guards in our sampled set: Marks all guards as
-   maybe-reachable so that we 'll try them again. */
+   maybe-reachable so that we'll try them again. */
 static void
 mark_all_guards_maybe_reachable(guard_selection_t *gs)
 {
@@ -1045,7 +1062,7 @@ get_max_sample_size(guard_selection_t *gs,
 }
 
 /**
- * Return a smartlist of the all the guards that are not currently
+ * Return a smartlist of all the guards that are not currently
  * members of the sample (GUARDS - SAMPLED_GUARDS).  The elements of
  * this list are node_t pointers in the non-bridge case, and
  * bridge_info_t pointers in the bridge case.  Set *<b>n_guards_out</b>
@@ -1575,6 +1592,19 @@ guard_create_exit_restriction(const uint8_t *exit_id)
   return rst;
 }
 
+/* Allocate and return a new exit guard restriction that excludes all current
+ * and pending conflux guards */
+STATIC entry_guard_restriction_t *
+guard_create_conflux_restriction(const origin_circuit_t *circ)
+{
+  entry_guard_restriction_t *rst = NULL;
+  rst = tor_malloc_zero(sizeof(entry_guard_restriction_t));
+  rst->type = RST_EXCL_LIST;
+  rst->excluded = smartlist_new();
+  conflux_add_guards_to_exclude_list(circ, rst->excluded);
+  return rst;
+}
+
 /** If we have fewer than this many possible usable guards, don't set
  * MD-availability-based restrictions: we might denylist all of them. */
 #define MIN_GUARDS_FOR_MD_RESTRICTION 10
@@ -1652,6 +1682,17 @@ guard_obeys_md_dirserver_restriction(const entry_guard_t *guard)
 }
 
 /**
+ * Return true if a restriction is reachability related, such that it should
+ * cause us to consider additional primary guards when selecting one.
+ */
+static bool
+entry_guard_restriction_is_reachability(const entry_guard_restriction_t *rst)
+{
+  tor_assert(rst);
+  return (rst->type == RST_OUTDATED_MD_DIRSERVER);
+}
+
+/**
  * Return true iff <b>guard</b> obeys the restrictions defined in <b>rst</b>.
  * (If <b>rst</b> is NULL, there are no restrictions.)
  */
@@ -1667,6 +1708,8 @@ entry_guard_obeys_restriction(const entry_guard_t *guard,
     return guard_obeys_exit_restriction(guard, rst);
   } else if (rst->type == RST_OUTDATED_MD_DIRSERVER) {
     return guard_obeys_md_dirserver_restriction(guard);
+  } else if (rst->type == RST_EXCL_LIST) {
+    return !smartlist_contains_digest(rst->excluded, guard->identity);
   }
 
   tor_assert_nonfatal_unreached();
@@ -1882,7 +1925,7 @@ make_guard_confirmed(guard_selection_t *gs, entry_guard_t *guard)
 
   guard->confirmed_idx = gs->next_confirmed_idx++;
   smartlist_add(gs->confirmed_entry_guards, guard);
-  /** The confirmation ordering might not be the sample ording. We need to
+  /** The confirmation ordering might not be the sample ordering. We need to
    * reorder */
   smartlist_sort(gs->confirmed_entry_guards, compare_guards_by_sampled_idx);
 
@@ -2046,6 +2089,14 @@ entry_guard_consider_retry(entry_guard_t *guard)
     get_retry_schedule(guard->failing_since, now, guard->is_primary);
   const time_t last_attempt = guard->last_tried_to_connect;
 
+  /* Check if it is a bridge and we don't have its descriptor yet */
+  if (guard->bridge_addr && !guard_has_descriptor(guard)) {
+    /* We want to leave the retry schedule to fetch_bridge_descriptors(),
+     * so we don't have two retry schedules clobbering each other. See
+     * bugs 40396 and 40497 for details of why we need this exception. */
+    return;
+  }
+
   if (BUG(last_attempt == 0) ||
       now >= last_attempt + delay) {
     /* We should mark this retriable. */
@@ -2087,14 +2138,44 @@ select_primary_guard_for_circuit(guard_selection_t *gs,
   const int need_descriptor = (usage == GUARD_USAGE_TRAFFIC);
   entry_guard_t *chosen_guard = NULL;
 
-  int num_entry_guards = get_n_primary_guards_to_use(usage);
+  int num_entry_guards_to_consider = get_n_primary_guards_to_use(usage);
   smartlist_t *usable_primary_guards = smartlist_new();
+  int num_entry_guards_considered = 0;
 
   SMARTLIST_FOREACH_BEGIN(gs->primary_entry_guards, entry_guard_t *, guard) {
     entry_guard_consider_retry(guard);
     if (!entry_guard_obeys_restriction(guard, rst)) {
       log_info(LD_GUARD, "Entry guard %s doesn't obey restriction, we test the"
           " next one", entry_guard_describe(guard));
+      if (!entry_guard_restriction_is_reachability(rst)) {
+        log_info(LD_GUARD,
+                 "Skipping guard %s due to circuit path restriction. "
+                 "Have %d, considered: %d, to consider: %d",
+                 entry_guard_describe(guard),
+                 smartlist_len(usable_primary_guards),
+                 num_entry_guards_considered,
+                 num_entry_guards_to_consider);
+        /* If the restriction is a circuit path restriction (as opposed to a
+         * reachability restriction), count this as considered. */
+        num_entry_guards_considered++;
+
+        /* If we have considered enough guards, *and* we actually have a guard,
+         * then proceed to select one from the list. */
+        if (num_entry_guards_considered >= num_entry_guards_to_consider) {
+          /* This should not happen with 2-leg conflux unless there is a
+           * race between removing a failed leg and a retry, but check
+           * anyway and log. */
+          if (smartlist_len(usable_primary_guards) == 0) {
+            static ratelim_t guardlog = RATELIM_INIT(60);
+            log_fn_ratelim(&guardlog, LOG_NOTICE, LD_GUARD,
+                           "All current guards excluded by path restriction "
+                           "type %d; using an additonal guard.",
+                           rst->type);
+          } else {
+            break;
+          }
+        }
+      }
       continue;
     }
     if (guard->is_reachable != GUARD_REACHABLE_NO) {
@@ -2106,8 +2187,16 @@ select_primary_guard_for_circuit(guard_selection_t *gs,
       *state_out = GUARD_CIRC_STATE_USABLE_ON_COMPLETION;
       guard->last_tried_to_connect = approx_time();
       smartlist_add(usable_primary_guards, guard);
-      if (smartlist_len(usable_primary_guards) >= num_entry_guards)
+      num_entry_guards_considered++;
+
+      /* If we have considered enough guards, then proceed to select
+       * one from the list. */
+      if (num_entry_guards_considered >= num_entry_guards_to_consider) {
         break;
+      }
+    } else {
+      log_info(LD_GUARD, "Guard %s is not reachable",
+          entry_guard_describe(guard));
     }
   } SMARTLIST_FOREACH_END(guard);
 
@@ -2117,6 +2206,10 @@ select_primary_guard_for_circuit(guard_selection_t *gs,
         "Selected primary guard %s for circuit from a list size of %d.",
         entry_guard_describe(chosen_guard),
         smartlist_len(usable_primary_guards));
+    /* Describe each guard in the list: */
+    SMARTLIST_FOREACH_BEGIN(usable_primary_guards, entry_guard_t *, guard) {
+      log_info(LD_GUARD, "  %s", entry_guard_describe(guard));
+    } SMARTLIST_FOREACH_END(guard);
     smartlist_free(usable_primary_guards);
   }
 
@@ -2222,16 +2315,22 @@ select_entry_guard_for_circuit(guard_selection_t *gs,
   /* "If any entry in PRIMARY_GUARDS has {is_reachable} status of
       <maybe> or <yes>, return the first such guard." */
   chosen_guard = select_primary_guard_for_circuit(gs, usage, rst, state_out);
-  if (chosen_guard)
+  if (chosen_guard) {
+    log_info(LD_GUARD, "Selected primary guard %s for circuit.",
+             entry_guard_describe(chosen_guard));
     return chosen_guard;
+  }
 
   /* "Otherwise, if the ordered intersection of {CONFIRMED_GUARDS}
       and {USABLE_FILTERED_GUARDS} is nonempty, return the first
       entry in that intersection that has {is_pending} set to
       false." */
   chosen_guard = select_confirmed_guard_for_circuit(gs, usage, rst, state_out);
-  if (chosen_guard)
+  if (chosen_guard) {
+     log_info(LD_GUARD, "Selected confirmed guard %s for circuit.",
+             entry_guard_describe(chosen_guard));
     return chosen_guard;
+  }
 
   /* "Otherwise, if there is no such entry, select a member
    * {USABLE_FILTERED_GUARDS} following the sample ordering" */
@@ -2244,6 +2343,8 @@ select_entry_guard_for_circuit(guard_selection_t *gs,
     return NULL;
   }
 
+  log_info(LD_GUARD, "Selected filtered guard %s for circuit.",
+             entry_guard_describe(chosen_guard));
   return chosen_guard;
 }
 
@@ -2271,6 +2372,13 @@ entry_guards_note_guard_failure(guard_selection_t *gs,
            guard->is_primary?"primary ":"",
            guard->confirmed_idx>=0?"confirmed ":"",
            entry_guard_describe(guard));
+
+  /* Schedule a re-assessment of whether we have enough dir info to
+   * use the network. Counterintuitively, *losing* a bridge might actually
+   * be just what we need to *resume* using the network, if we had it in
+   * state GUARD_REACHABLE_MAYBE and we were stalling to learn this
+   * outcome. See bug 40396 for more details. */
+  router_dir_info_changed();
 }
 
 /**
@@ -2295,6 +2403,12 @@ entry_guards_note_guard_success(guard_selection_t *gs,
   /* If guard was not already marked as reachable, send a GUARD UP signal */
   if (guard->is_reachable != GUARD_REACHABLE_YES) {
     control_event_guard(guard->nickname, guard->identity, "UP");
+
+    /* Schedule a re-assessment of whether we have enough dir info to
+     * use the network. One of our guards has just moved to
+     * GUARD_REACHABLE_YES, so maybe we can resume using the network
+     * now. */
+    router_dir_info_changed();
   }
 
   guard->is_reachable = GUARD_REACHABLE_YES;
@@ -2393,6 +2507,11 @@ entry_guard_has_higher_priority(entry_guard_t *a, entry_guard_t *b)
 STATIC void
 entry_guard_restriction_free_(entry_guard_restriction_t *rst)
 {
+  if (rst && rst->excluded) {
+    SMARTLIST_FOREACH(rst->excluded, void *, g,
+                      tor_free(g));
+    smartlist_free(rst->excluded);
+  }
   tor_free(rst);
 }
 
@@ -2709,7 +2828,7 @@ entry_guards_upgrade_waiting_circuits(guard_selection_t *gs,
           {NONPRIMARY_GUARD_CONNECT_TIMEOUT} seconds."
     */
     circuit_guard_state_t *state = origin_circuit_get_guard_state(circ);
-    if BUG((state == NULL))
+    if (BUG(state == NULL))
       continue;
     if (state->state != GUARD_CIRC_STATE_COMPLETE)
       continue;
@@ -3538,6 +3657,11 @@ entry_guards_changed_for_guard_selection(guard_selection_t *gs)
      entry_guards_update_guards_in_state()
   */
   or_state_mark_dirty(get_or_state(), when);
+
+  /* Schedule a re-assessment of whether we have enough dir info to
+   * use the network. When we add or remove or disable or enable a
+   * guard, the decision could shift. */
+  router_dir_info_changed();
 }
 
 /** Our list of entry guards has changed for the default guard selection
@@ -3741,7 +3865,8 @@ guards_update_all(void)
 /** Helper: pick a guard for a circuit, with whatever algorithm is
     used. */
 const node_t *
-guards_choose_guard(cpath_build_state_t *state,
+guards_choose_guard(const origin_circuit_t *circ,
+                    cpath_build_state_t *state,
                     uint8_t purpose,
                     circuit_guard_state_t **guard_state_out)
 {
@@ -3749,14 +3874,18 @@ guards_choose_guard(cpath_build_state_t *state,
   const uint8_t *exit_id = NULL;
   entry_guard_restriction_t *rst = NULL;
 
-  /* Only apply restrictions if we have a specific exit node in mind, and only
-   * if we are not doing vanguard circuits: we don't want to apply guard
-   * restrictions to vanguard circuits. */
-  if (state && !circuit_should_use_vanguards(purpose) &&
+  /* If we this is a conflux circuit, build an exclusion list for it. */
+  if (CIRCUIT_IS_CONFLUX(TO_CIRCUIT(circ))) {
+    rst = guard_create_conflux_restriction(circ);
+    /* Don't allow connecting back to the exit if there is one */
+    if (state && (exit_id = build_state_get_exit_rsa_id(state))) {
+      /* add the exit_id to the excluded list */
+      smartlist_add(rst->excluded, tor_memdup(exit_id, DIGEST_LEN));
+    }
+  } else if (state && !circuit_should_use_vanguards(purpose) &&
       (exit_id = build_state_get_exit_rsa_id(state))) {
     /* We're building to a targeted exit node, so that node can't be
-     * chosen as our guard for this circuit.  Remember that fact in a
-     * restriction. */
+     * chosen as our guard for this circuit, unless we're vanguards. */
     rst = guard_create_exit_restriction(exit_id);
     tor_assert(rst);
   }
@@ -3930,6 +4059,265 @@ guard_selection_free_(guard_selection_t *gs)
   tor_free(gs);
 }
 
+/**********************************************************************/
+
+/** Layer2 guard subsystem (vanguards-lite) used for onion service circuits */
+
+/** A simple representation of a layer2 guard. We just need its identity so
+ *  that we feed it into a routerset, and a sampled timestamp to do expiration
+ *  checks. */
+typedef struct layer2_guard_t {
+  /** Identity of the guard */
+  char identity[DIGEST_LEN];
+  /** When does this guard expire? (randomized timestamp) */
+  time_t expire_on_date;
+} layer2_guard_t;
+
+#define layer2_guard_free(val) \
+  FREE_AND_NULL(layer2_guard_t, layer2_guard_free_, (val))
+
+/** Return true if the vanguards-lite subsystem is enabled */
+bool
+vanguards_lite_is_enabled(void)
+{
+  /* First check torrc option and then maybe also the consensus parameter. */
+  const or_options_t *options = get_options();
+
+  /* If the option is explicitly disabled, that's the final word here */
+  if (options->VanguardsLiteEnabled == 0) {
+    return false;
+  }
+
+  /* If the option is set to auto, then check the consensus parameter */
+  if (options->VanguardsLiteEnabled == -1) {
+    return networkstatus_get_param(NULL, "vanguards-lite-enabled",
+                                   1, /* default to "on" */
+                                   0, 1);
+  }
+
+  /* else it's enabled */
+  tor_assert_nonfatal(options->VanguardsLiteEnabled == 1);
+  return options->VanguardsLiteEnabled;
+}
+
+static void
+layer2_guard_free_(layer2_guard_t *l2)
+{
+  if (!l2) {
+    return;
+  }
+
+  tor_free(l2);
+}
+
+/** Global list and routerset of L2 guards. They are both synced and they get
+ * updated periodically. We need both the list and the routerset: we use the
+ * smartlist to keep track of expiration times and the routerset is what we
+ * return to the users of this subsystem. */
+static smartlist_t *layer2_guards = NULL;
+static routerset_t *layer2_routerset = NULL;
+
+/** Number of L2 guards */
+#define NUMBER_SECOND_GUARDS 4
+/** Make sure that the number of L2 guards is less than the number of
+ *  MAX_SANE_RESTRICTED_NODES */
+CTASSERT(NUMBER_SECOND_GUARDS < 20);
+
+/** Lifetime of L2 guards:
+ *  1 to 12 days, for an average of a week using the max(x,x) distribution */
+#define MIN_SECOND_GUARD_LIFETIME (3600*24)
+#define MAX_SECOND_GUARD_LIFETIME (3600*24*12)
+
+/** Return the number of guards our L2 guardset should have */
+static int
+get_number_of_layer2_hs_guards(void)
+{
+  return (int) networkstatus_get_param(NULL,
+                                        "guard-hs-l2-number",
+                                        NUMBER_SECOND_GUARDS,
+                                        1, 19);
+}
+
+/** Return the minimum lifetime of L2 guards */
+static int
+get_min_lifetime_of_layer2_hs_guards(void)
+{
+  return (int) networkstatus_get_param(NULL,
+                                       "guard-hs-l2-lifetime-min",
+                                       MIN_SECOND_GUARD_LIFETIME,
+                                       1, INT32_MAX);
+}
+
+/** Return the maximum lifetime of L2 guards */
+static int
+get_max_lifetime_of_layer2_hs_guards(void)
+{
+  return (int) networkstatus_get_param(NULL,
+                                        "guard-hs-l2-lifetime-max",
+                                       MAX_SECOND_GUARD_LIFETIME,
+                                       1, INT32_MAX);
+}
+
+/**
+ * Sample and return a lifetime for an L2 guard.
+ *
+ * Lifetime randomized uniformly between min and max consensus params.
+ */
+static int
+get_layer2_hs_guard_lifetime(void)
+{
+  int min = get_min_lifetime_of_layer2_hs_guards();
+  int max = get_max_lifetime_of_layer2_hs_guards();
+
+  if (BUG(min >= max)) {
+    return min;
+  }
+
+  return crypto_rand_int_range(min, max);
+}
+
+/** Maintain the L2 guard list. Make sure the list contains enough guards, do
+ *  expirations as necessary, and keep all the data structures of this
+ *  subsystem synchronized */
+void
+maintain_layer2_guards(void)
+{
+  if (!router_have_minimum_dir_info()) {
+    return;
+  }
+
+  /* Create the list if it doesn't exist */
+  if (!layer2_guards) {
+    layer2_guards = smartlist_new();
+  }
+
+  /* Go through the list and perform any needed expirations */
+  SMARTLIST_FOREACH_BEGIN(layer2_guards, layer2_guard_t *, g) {
+    /* Expire based on expiration date */
+    if (g->expire_on_date <= approx_time()) {
+      log_info(LD_GENERAL, "Removing expired Layer2 guard %s",
+               safe_str_client(hex_str(g->identity, DIGEST_LEN)));
+      // Nickname may be gone from consensus and doesn't matter anyway
+      control_event_guard("None", g->identity, "BAD_L2");
+      layer2_guard_free(g);
+      SMARTLIST_DEL_CURRENT_KEEPORDER(layer2_guards, g);
+      continue;
+    }
+
+    /* Expire if relay has left consensus */
+    const routerstatus_t *rs = router_get_consensus_status_by_id(g->identity);
+    if (rs == NULL || !rs->is_stable || !rs->is_fast) {
+      log_info(LD_GENERAL, "Removing %s Layer2 guard %s",
+               rs ? "unsuitable" : "missing",
+               safe_str_client(hex_str(g->identity, DIGEST_LEN)));
+      // Nickname may be gone from consensus and doesn't matter anyway
+      control_event_guard("None", g->identity, "BAD_L2");
+      layer2_guard_free(g);
+      SMARTLIST_DEL_CURRENT_KEEPORDER(layer2_guards, g);
+      continue;
+    }
+  } SMARTLIST_FOREACH_END(g);
+
+  /* Find out how many guards we need to add */
+  int new_guards_needed_n =
+    get_number_of_layer2_hs_guards() - smartlist_len(layer2_guards);
+  if (new_guards_needed_n <= 0) {
+    return;
+  }
+
+  log_info(LD_GENERAL, "Adding %d guards to Layer2 routerset",
+           new_guards_needed_n);
+
+  /* First gather the exclusions based on our current L2 guards */
+  smartlist_t *excluded = smartlist_new();
+  SMARTLIST_FOREACH_BEGIN(layer2_guards, layer2_guard_t *, g) {
+    /* Exclude existing L2 guard so that we don't double-pick it.
+     * But, it's ok if they come from the same family. */
+    const node_t *existing = node_get_by_id(g->identity);
+    if (existing)
+      smartlist_add(excluded, (node_t *)existing);
+  } SMARTLIST_FOREACH_END(g);
+
+  /* Add required guards to the list */
+  for (int i = 0; i < new_guards_needed_n; i++) {
+    const node_t *choice = NULL;
+    const or_options_t *options = get_options();
+    /* Pick Stable nodes */
+    router_crn_flags_t flags = CRN_NEED_DESC|CRN_NEED_UPTIME;
+    choice = router_choose_random_node(excluded, options->ExcludeNodes, flags);
+    if (!choice) {
+      break;
+    }
+
+    /* We found our node: create an L2 guard out of it */
+    layer2_guard_t *layer2_guard = tor_malloc_zero(sizeof(layer2_guard_t));
+    memcpy(layer2_guard->identity, choice->identity, DIGEST_LEN);
+    layer2_guard->expire_on_date = approx_time() +
+      get_layer2_hs_guard_lifetime();
+    smartlist_add(layer2_guards, layer2_guard);
+    log_info(LD_GENERAL, "Adding Layer2 guard %s",
+             safe_str_client(hex_str(layer2_guard->identity, DIGEST_LEN)));
+    // Nickname can also be None here because it is looked up later
+    control_event_guard("None", layer2_guard->identity,
+                        "GOOD_L2");
+    /* Exclude this node so that we don't double-pick it. (Again, coming
+     * from the same family is ok here.) */
+    smartlist_add(excluded, (node_t *)choice);
+  }
+
+  /* Some cleanup */
+  smartlist_free(excluded);
+
+  /* Now that the list is up to date, synchronize the routerset */
+  routerset_free(layer2_routerset);
+  layer2_routerset = routerset_new();
+
+  SMARTLIST_FOREACH_BEGIN (layer2_guards, layer2_guard_t *, g) {
+    routerset_parse(layer2_routerset,
+                    hex_str(g->identity, DIGEST_LEN),
+                    "l2 guards");
+  } SMARTLIST_FOREACH_END(g);
+}
+
+/**
+ * Reset vanguards-lite list(s).
+ *
+ * Used for SIGNAL NEWNYM.
+ */
+void
+purge_vanguards_lite(void)
+{
+  if (!layer2_guards)
+    return;
+
+  /* Go through the list and perform any needed expirations */
+  SMARTLIST_FOREACH_BEGIN(layer2_guards, layer2_guard_t *, g) {
+    layer2_guard_free(g);
+  } SMARTLIST_FOREACH_END(g);
+
+  smartlist_clear(layer2_guards);
+
+  /* Pick new l2 guards */
+  maintain_layer2_guards();
+}
+
+/** Return a routerset containing the L2 guards or NULL if it's not yet
+ *  initialized. Callers must not free the routerset. Designed for use in
+ *  pick_vanguard_middle_node() and should not be used anywhere else. Do not
+ *  store this pointer -- any future calls to maintain_layer2_guards() and
+ *  purge_vanguards_lite() can invalidate it. */
+const routerset_t *
+get_layer2_guards(void)
+{
+  if (!layer2_guards) {
+    maintain_layer2_guards();
+  }
+
+  return layer2_routerset;
+}
+
+/*****************************************************************************/
+
 /** Release all storage held by the list of entry guards and related
  * memory structs. */
 void
@@ -3946,4 +4334,15 @@ entry_guards_free_all(void)
     guard_contexts = NULL;
   }
   circuit_build_times_free_timeouts(get_circuit_build_times_mutable());
+
+  if (!layer2_guards) {
+    return;
+  }
+
+  SMARTLIST_FOREACH_BEGIN(layer2_guards, layer2_guard_t *, g) {
+    layer2_guard_free(g);
+  } SMARTLIST_FOREACH_END(g);
+
+  smartlist_free(layer2_guards);
+  routerset_free(layer2_routerset);
 }

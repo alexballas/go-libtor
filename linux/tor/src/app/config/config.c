@@ -77,6 +77,7 @@
 #include "core/or/circuitmux_ewma.h"
 #include "core/or/circuitstats.h"
 #include "core/or/connection_edge.h"
+#include "trunnel/conflux.h"
 #include "core/or/dos.h"
 #include "core/or/policies.h"
 #include "core/or/relay.h"
@@ -88,9 +89,11 @@
 #include "feature/control/control.h"
 #include "feature/control/control_auth.h"
 #include "feature/control/control_events.h"
+#include "feature/dircache/dirserv.h"
 #include "feature/dirclient/dirclient_modes.h"
 #include "feature/hibernate/hibernate.h"
 #include "feature/hs/hs_config.h"
+#include "feature/hs/hs_pow.h"
 #include "feature/metrics/metrics.h"
 #include "feature/nodelist/dirlist.h"
 #include "feature/nodelist/networkstatus.h"
@@ -179,7 +182,7 @@ static const char unix_q_socket_prefix[] = "unix:\"";
 #define MAX_CONSTRAINED_TCP_BUFFER 262144  /* 256k */
 
 /** macro to help with the bulk rename of *DownloadSchedule to
- * *DowloadInitialDelay . */
+ * *DownloadInitialDelay . */
 #ifndef COCCI
 #define DOWNLOAD_SCHEDULE(name) \
   { (#name "DownloadSchedule"), (#name "DownloadInitialDelay"), 0, 1 }
@@ -193,6 +196,7 @@ static const config_abbrev_t option_abbrevs_[] = {
   PLURAL(AuthDirBadDirCC),
   PLURAL(AuthDirBadExitCC),
   PLURAL(AuthDirInvalidCC),
+  PLURAL(AuthDirMiddleOnlyCC),
   PLURAL(AuthDirRejectCC),
   PLURAL(EntryNode),
   PLURAL(ExcludeNode),
@@ -331,6 +335,8 @@ static const config_var_t option_vars_[] = {
   V(AuthDirBadExitCCs,           CSV,      ""),
   V(AuthDirInvalid,              LINELIST, NULL),
   V(AuthDirInvalidCCs,           CSV,      ""),
+  V(AuthDirMiddleOnly,           LINELIST, NULL),
+  V(AuthDirMiddleOnlyCCs,        CSV,      ""),
   V(AuthDirReject,               LINELIST, NULL),
   V(AuthDirRejectCCs,            CSV,      ""),
   OBSOLETE("AuthDirRejectUnlisted"),
@@ -372,8 +378,12 @@ static const config_var_t option_vars_[] = {
   OBSOLETE("ClientAutoIPv6ORPort"),
   V(ClientRejectInternalAddresses, BOOL,   "1"),
   V(ClientTransportPlugin,       LINELIST, NULL),
-  V(ClientUseIPv6,               BOOL,     "0"),
+  V(ClientUseIPv6,               BOOL,     "1"),
   V(ClientUseIPv4,               BOOL,     "1"),
+  V(CompiledProofOfWorkHash,     AUTOBOOL, "auto"),
+  V(ConfluxEnabled,              AUTOBOOL, "auto"),
+  VAR("ConfluxClientUX",         STRING,   ConfluxClientUX_option,
+          "throughput"),
   V(ConnLimit,                   POSINT,     "1000"),
   V(ConnDirectionStatistics,     BOOL,     "0"),
   V(ConstrainedSockets,          BOOL,     "0"),
@@ -504,6 +514,9 @@ static const config_var_t option_vars_[] = {
       LINELIST_S, RendConfigLines, NULL),
   VAR("HiddenServiceOnionBalanceInstance",
       LINELIST_S, RendConfigLines, NULL),
+  VAR("HiddenServicePoWDefensesEnabled", LINELIST_S, RendConfigLines, NULL),
+  VAR("HiddenServicePoWQueueRate", LINELIST_S, RendConfigLines, NULL),
+  VAR("HiddenServicePoWQueueBurst", LINELIST_S, RendConfigLines, NULL),
   VAR("HiddenServiceStatistics", BOOL, HiddenServiceStatistics_option, "1"),
   V(ClientOnionAuthDir,          FILENAME, NULL),
   OBSOLETE("CloseHSClientCircuitsImmediatelyOnTimeout"),
@@ -546,7 +559,7 @@ static const config_var_t option_vars_[] = {
   V(MaxConsensusAgeForDiffs,     INTERVAL, "0 seconds"),
   VAR("MaxMemInQueues",          MEMUNIT,   MaxMemInQueues_raw, "0"),
   OBSOLETE("MaxOnionsPending"),
-  V(MaxOnionQueueDelay,          MSEC_INTERVAL, "1750 msec"),
+  V(MaxOnionQueueDelay,          MSEC_INTERVAL, "0"),
   V(MaxUnparseableDescSizeToLog, MEMUNIT, "10 MB"),
   VPORT(MetricsPort),
   V(MetricsPortPolicy,           LINELIST, NULL),
@@ -616,11 +629,11 @@ static const config_var_t option_vars_[] = {
   V(ConnectionPadding,           AUTOBOOL, "auto"),
   V(RefuseUnknownExits,          AUTOBOOL, "auto"),
   V(CircuitPadding,              BOOL,     "1"),
+  V(ReconfigDropsBridgeDescs,    BOOL,     "0"),
   V(ReducedCircuitPadding,       BOOL,     "0"),
   V(RejectPlaintextPorts,        CSV,      ""),
   V(RelayBandwidthBurst,         MEMUNIT,  "0"),
   V(RelayBandwidthRate,          MEMUNIT,  "0"),
-  V(RendPostPeriod,              INTERVAL, "1 hour"), /* Used internally. */
   V(RephistTrackTime,            INTERVAL, "24 hours"),
   V_IMMUTABLE(RunAsDaemon,       BOOL,     "0"),
   V(ReducedExitPolicy,           BOOL,     "0"),
@@ -668,8 +681,11 @@ static const config_var_t option_vars_[] = {
   VAR("UseEntryGuards",          BOOL,     UseEntryGuards_option, "1"),
   OBSOLETE("UseEntryGuardsAsDirGuards"),
   V(UseGuardFraction,            AUTOBOOL, "auto"),
+  V(VanguardsLiteEnabled,        AUTOBOOL, "auto"),
   V(UseMicrodescriptors,         AUTOBOOL, "auto"),
   OBSOLETE("UseNTorHandshake"),
+  VAR("__AlwaysCongestionControl",  BOOL, AlwaysCongestionControl, "0"),
+  VAR("__SbwsExit",  BOOL, SbwsExit, "0"),
   V_IMMUTABLE(User,              STRING,   NULL),
   OBSOLETE("UserspaceIOCPBuffers"),
   OBSOLETE("V1AuthoritativeDirectory"),
@@ -2309,6 +2325,8 @@ options_act,(const or_options_t *old_options))
     }
 
     if (transition_affects_guards) {
+      if (options->ReconfigDropsBridgeDescs)
+        routerlist_drop_bridge_descriptors();
       if (guards_update_all()) {
         abandon_circuits = 1;
       }
@@ -2719,11 +2737,19 @@ list_deprecated_options(void)
 static void
 list_enabled_modules(void)
 {
-  printf("%s: %s\n", "relay", have_module_relay() ? "yes" : "no");
-  printf("%s: %s\n", "dirauth", have_module_dirauth() ? "yes" : "no");
-  // We don't list dircache, because it cannot be enabled or disabled
-  // independently from relay.  Listing it here would proliferate
-  // test variants in test_parseconf.sh to no useful purpose.
+  static const struct {
+    const char *name;
+    bool have;
+  } list[] = {
+    { "relay", have_module_relay() },
+    { "dirauth", have_module_dirauth() },
+    { "dircache", have_module_dircache() },
+    { "pow", have_module_pow() }
+  };
+
+  for (unsigned i = 0; i < sizeof list / sizeof list[0]; i++) {
+    printf("%s: %s\n", list[i].name, list[i].have ? "yes" : "no");
+  }
 }
 
 /** Prints compile-time and runtime library versions. */
@@ -2965,18 +2991,10 @@ config_ensure_bandwidth_cap(uint64_t *value, const char *desc, char **msg)
   return 0;
 }
 
-/** Lowest allowable value for RendPostPeriod; if this is too low, hidden
- * services can overload the directory system. */
-#define MIN_REND_POST_PERIOD (10*60)
-#define MIN_REND_POST_PERIOD_TESTING (5)
-
 /** Highest allowable value for CircuitsAvailableTimeout.
  * If this is too large, client connections will stay open for too long,
  * incurring extra padding overhead. */
 #define MAX_CIRCS_AVAILABLE_TIME (24*60*60)
-
-/** Highest allowable value for RendPostPeriod. */
-#define MAX_DIR_PERIOD ((7*24*60*60)/2)
 
 /** Lowest allowable value for MaxCircuitDirtiness; if this is too low, Tor
  * will generate too many circuits and potentially overload the network. */
@@ -3531,26 +3549,26 @@ options_validate_cb(const void *old_options_, void *options_, char **msg)
     return -1;
   }
 
+ options->ConfluxClientUX = CONFLUX_UX_HIGH_THROUGHPUT;
+ if (options->ConfluxClientUX_option) {
+    if (!strcmp(options->ConfluxClientUX_option, "latency"))
+      options->ConfluxClientUX = CONFLUX_UX_MIN_LATENCY;
+    else if (!strcmp(options->ConfluxClientUX_option, "throughput"))
+      options->ConfluxClientUX = CONFLUX_UX_HIGH_THROUGHPUT;
+    else if (!strcmp(options->ConfluxClientUX_option, "latency_lowmem"))
+      options->ConfluxClientUX = CONFLUX_UX_LOW_MEM_LATENCY;
+    else if (!strcmp(options->ConfluxClientUX_option, "throughput_lowmem"))
+      options->ConfluxClientUX = CONFLUX_UX_LOW_MEM_THROUGHPUT;
+    else
+      REJECT("ConfluxClientUX must be 'latency', 'throughput, "
+             "'latency_lowmem', or 'throughput_lowmem'");
+  }
+
   if (options_validate_publish_server(old_options, options, msg) < 0)
     return -1;
 
   if (options_validate_relay_padding(old_options, options, msg) < 0)
     return -1;
-
-  const int min_rendpostperiod =
-    options->TestingTorNetwork ?
-    MIN_REND_POST_PERIOD_TESTING : MIN_REND_POST_PERIOD;
-  if (options->RendPostPeriod < min_rendpostperiod) {
-    log_warn(LD_CONFIG, "RendPostPeriod option is too short; "
-             "raising to %d seconds.", min_rendpostperiod);
-    options->RendPostPeriod = min_rendpostperiod;
-  }
-
-  if (options->RendPostPeriod > MAX_DIR_PERIOD) {
-    log_warn(LD_CONFIG, "RendPostPeriod is too large; clipping to %ds.",
-             MAX_DIR_PERIOD);
-    options->RendPostPeriod = MAX_DIR_PERIOD;
-  }
 
   /* Check the Single Onion Service options */
   if (options_validate_single_onion(options, msg) < 0)
@@ -4487,6 +4505,10 @@ options_init_from_torrc(int argc, char **argv)
 
   if (config_line_find(cmdline_only_options, "--version")) {
     printf("Tor version %s.\n",get_version());
+#ifdef ENABLE_GPL
+    printf("This build of Tor is covered by the GNU General Public License "
+            "(https://www.gnu.org/licenses/gpl-3.0.en.html)\n");
+#endif
     printf("Tor is running on %s with Libevent %s, "
             "%s %s, Zlib %s, Liblzma %s, Libzstd %s and %s %s as libc.\n",
             get_uname(),
@@ -5468,6 +5490,77 @@ pt_parse_transport_line(const or_options_t *options,
   return r;
 }
 
+/**
+ * Parse a flag describing an extra dirport for a directory authority.
+ *
+ * Right now, the supported format is exactly:
+ * `{upload,download,voting}=http://[IP:PORT]/`.
+ * Other URL schemes, and other suffixes, might be supported in the future.
+ *
+ * Only call this function if `flag` starts with one of the above strings.
+ *
+ * Return 0 on success, and -1 on failure.
+ *
+ * If `ds` is provided, then add any parsed dirport to `ds`.  If `ds` is NULL,
+ * take no action other than parsing.
+ **/
+static int
+parse_dirauth_dirport(dir_server_t *ds, const char *flag)
+{
+  tor_assert(flag);
+
+  auth_dirport_usage_t usage;
+
+  if (!strcasecmpstart(flag, "upload=")) {
+    usage = AUTH_USAGE_UPLOAD;
+  } else if (!strcasecmpstart(flag, "download=")) {
+    usage = AUTH_USAGE_DOWNLOAD;
+  } else if (!strcasecmpstart(flag, "vote=")) {
+    usage = AUTH_USAGE_VOTING;
+  } else {
+    // We shouldn't get called with a flag that we don't recognize.
+    tor_assert_nonfatal_unreached();
+    return -1;
+  }
+
+  const char *eq = strchr(flag, '=');
+  tor_assert(eq);
+  const char *target = eq + 1;
+
+  // Find the part inside the http://{....}/
+  if (strcmpstart(target, "http://")) {
+    log_warn(LD_CONFIG, "Unsupported URL scheme in authority flag %s", flag);
+    return -1;
+  }
+  const char *addr = target + strlen("http://");
+
+  const char *eos = strchr(addr, '/');
+  size_t addr_len;
+  if (eos && strcmp(eos, "/")) {
+    log_warn(LD_CONFIG, "Unsupported URL prefix in authority flag %s", flag);
+    return -1;
+  } else if (eos) {
+    addr_len = eos - addr;
+  } else {
+    addr_len = strlen(addr);
+  }
+
+  // Finally, parse the addr:port part.
+  char *addr_string = tor_strndup(addr, addr_len);
+  tor_addr_port_t dirport;
+  memset(&dirport, 0, sizeof(dirport));
+  int rv = tor_addr_port_parse(LOG_WARN, addr_string,
+                               &dirport.addr, &dirport.port, -1);
+  if (ds != NULL && rv == 0) {
+    trusted_dir_server_add_dirport(ds, usage, &dirport);
+  } else if (rv == -1) {
+    log_warn(LD_CONFIG, "Unable to parse address in authority flag %s",flag);
+  }
+
+  tor_free(addr_string);
+  return rv;
+}
+
 /** Read the contents of a DirAuthority line from <b>line</b>. If
  * <b>validate_only</b> is 0, and the line is well-formed, and it
  * shares any bits with <b>required_type</b> or <b>required_type</b>
@@ -5488,6 +5581,7 @@ parse_dir_authority_line(const char *line, dirinfo_type_t required_type,
   char v3_digest[DIGEST_LEN];
   dirinfo_type_t type = 0;
   double weight = 1.0;
+  smartlist_t *extra_dirports = smartlist_new();
 
   memset(v3_digest, 0, sizeof(v3_digest));
 
@@ -5556,6 +5650,12 @@ parse_dir_authority_line(const char *line, dirinfo_type_t required_type,
         }
         ipv6_addrport_ptr = &ipv6_addrport;
       }
+    } else if (!strcasecmpstart(flag, "upload=") ||
+               !strcasecmpstart(flag, "download=") ||
+               !strcasecmpstart(flag, "vote=")) {
+      // We'll handle these after creating the authority object.
+      smartlist_add(extra_dirports, flag);
+      flag =  NULL; // prevent double-free.
     } else {
       log_warn(LD_CONFIG, "Unrecognized flag '%s' on DirAuthority line",
                flag);
@@ -5599,6 +5699,13 @@ parse_dir_authority_line(const char *line, dirinfo_type_t required_type,
     goto err;
   }
 
+  if (validate_only) {
+    SMARTLIST_FOREACH_BEGIN(extra_dirports, const char *, cp) {
+      if (parse_dirauth_dirport(NULL, cp) < 0)
+        goto err;
+    } SMARTLIST_FOREACH_END(cp);
+  }
+
   if (!validate_only && (!required_type || required_type & type)) {
     dir_server_t *ds;
     if (required_type)
@@ -5610,16 +5717,23 @@ parse_dir_authority_line(const char *line, dirinfo_type_t required_type,
                                       ipv6_addrport_ptr,
                                       digest, v3_digest, type, weight)))
       goto err;
+
+    SMARTLIST_FOREACH_BEGIN(extra_dirports, const char *, cp) {
+      if (parse_dirauth_dirport(ds, cp) < 0)
+        goto err;
+    } SMARTLIST_FOREACH_END(cp);
     dir_server_add(ds);
   }
 
   r = 0;
   goto done;
 
-  err:
+ err:
   r = -1;
 
-  done:
+ done:
+  SMARTLIST_FOREACH(extra_dirports, char*, s, tor_free(s));
+  smartlist_free(extra_dirports);
   SMARTLIST_FOREACH(items, char*, s, tor_free(s));
   smartlist_free(items);
   tor_free(addrport);
@@ -7179,7 +7293,7 @@ getinfo_helper_config(control_connection_t *conn,
 }
 
 /* Check whether an address has already been set against the options
- * depending on address family and destination type. Any exsting
+ * depending on address family and destination type. Any existing
  * value will lead to a fail, even if it is the same value. If not
  * set and not only validating, copy it into this location too.
  * Returns 0 on success or -1 if this address is already set.

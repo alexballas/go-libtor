@@ -256,6 +256,7 @@ int connection_wants_to_flush(struct connection_t *conn);
 int connection_outbuf_too_full(struct connection_t *conn);
 int connection_handle_write(struct connection_t *conn, int force);
 int connection_flush(struct connection_t *conn);
+int connection_process_inbuf(struct connection_t *conn, int package_partial);
 
 MOCK_DECL(void, connection_write_to_buf_impl_,
           (const char *string, size_t len, struct connection_t *conn,
@@ -274,8 +275,8 @@ void connection_buf_add_compress(const char *string, size_t len,
                                  struct dir_connection_t *conn, int done);
 void connection_buf_add_buf(struct connection_t *conn, struct buf_t *buf);
 
-size_t connection_get_inbuf_len(struct connection_t *conn);
-size_t connection_get_outbuf_len(struct connection_t *conn);
+size_t connection_get_inbuf_len(const struct connection_t *conn);
+size_t connection_get_outbuf_len(const struct connection_t *conn);
 struct connection_t *connection_get_by_global_id(uint64_t id);
 
 struct connection_t *connection_get_by_type(int type);

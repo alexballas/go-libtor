@@ -140,6 +140,41 @@ bridge_list_get(void)
 }
 
 /**
+ * Returns true if there are enough bridges to make a conflux set
+ * without re-using the same bridge.
+ */
+bool
+conflux_can_exclude_used_bridges(void)
+{
+  if (smartlist_len(bridge_list_get()) == 1) {
+    static bool warned_once = false;
+    bridge_info_t *bridge = smartlist_get(bridge_list_get(), 0);
+    tor_assert(bridge);
+
+    /* Snowflake is a special case. With one snowflake bridge,
+     * you are load balanced among many back-end bridges.
+     * So we do not need to warn the user for it. */
+    if (bridge->transport_name &&
+        strcasecmp(bridge->transport_name, "snowflake") == 0) {
+      return false;
+    }
+
+    if (!warned_once) {
+      log_warn(LD_CIRC, "Only one bridge (transport: '%s') is configured. "
+                        "You should have at least two for conflux, "
+                        "for any transport that is not 'snowflake'.",
+                        bridge->transport_name ?
+                          bridge->transport_name : "vanilla");
+      warned_once = true;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Given a <b>bridge</b>, return a pointer to its RSA identity digest, or
  * NULL if we don't know one for it.
  */
@@ -943,9 +978,17 @@ rewrite_node_address_for_bridge(const bridge_info_t *bridge, node_t *node)
 }
 
 /** We just learned a descriptor for a bridge. See if that
- * digest is in our entry guard list, and add it if not. */
+ * digest is in our entry guard list, and add it if not. Schedule the
+ * next fetch for a long time from now, and initiate any follow-up
+ * activities like continuing to bootstrap.
+ *
+ * <b>from_cache</b> * tells us whether we fetched it from disk (else
+ * the network)
+ *
+ * <b>desc_is_new</b> tells us if we preferred it to the old version we
+ * had, if any. */
 void
-learned_bridge_descriptor(routerinfo_t *ri, int from_cache)
+learned_bridge_descriptor(routerinfo_t *ri, int from_cache, int desc_is_new)
 {
   tor_assert(ri);
   tor_assert(ri->purpose == ROUTER_PURPOSE_BRIDGE);
@@ -961,12 +1004,14 @@ learned_bridge_descriptor(routerinfo_t *ri, int from_cache)
 
     if (bridge) { /* if we actually want to use this one */
       node_t *node;
-      /* it's here; schedule its re-fetch for a long time from now. */
       if (!from_cache) {
         /* This schedules the re-fetch at a constant interval, which produces
          * a pattern of bridge traffic. But it's better than trying all
          * configured bridges several times in the first few minutes. */
         download_status_reset(&bridge->fetch_status);
+        /* it's here; schedule its re-fetch for a long time from now. */
+        bridge->fetch_status.next_attempt_at +=
+          get_options()->TestingBridgeDownloadInitialDelay;
       }
 
       node = node_get_mutable_by_id(ri->cache_info.identity_digest);
@@ -982,8 +1027,10 @@ learned_bridge_descriptor(routerinfo_t *ri, int from_cache)
       entry_guard_learned_bridge_identity(&bridge->addrport_configured,
                               (const uint8_t*)ri->cache_info.identity_digest);
 
-      log_notice(LD_DIR, "new bridge descriptor '%s' (%s): %s", ri->nickname,
-                 from_cache ? "cached" : "fresh", router_describe(ri));
+      if (desc_is_new)
+        log_notice(LD_DIR, "new bridge descriptor '%s' (%s): %s",
+                   ri->nickname,
+                   from_cache ? "cached" : "fresh", router_describe(ri));
       /* If we didn't have a reachable bridge before this one, try directory
        * documents again. */
       if (first) {

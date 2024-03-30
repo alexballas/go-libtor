@@ -65,6 +65,7 @@
 #include "core/or/scheduler.h"
 #include "feature/nodelist/torcert.h"
 #include "core/or/channelpadding.h"
+#include "core/or/congestion_control_common.h"
 #include "feature/dirauth/authmode.h"
 #include "feature/hs/hs_service.h"
 
@@ -178,13 +179,18 @@ connection_or_set_identity_digest(or_connection_t *conn,
   const int rsa_id_was_set = ! tor_digest_is_zero(conn->identity_digest);
   const int ed_id_was_set =
     chan && !ed25519_public_key_is_zero(&chan->ed25519_identity);
+  const int new_ed_id_is_set =
+    (ed_id && !ed25519_public_key_is_zero(ed_id));
   const int rsa_changed =
     tor_memneq(conn->identity_digest, rsa_digest, DIGEST_LEN);
-  const int ed_changed = ed_id_was_set &&
-    (!ed_id || !ed25519_pubkey_eq(ed_id, &chan->ed25519_identity));
+  const int ed_changed = bool_neq(ed_id_was_set, new_ed_id_is_set) ||
+    (ed_id_was_set && new_ed_id_is_set && chan &&
+     !ed25519_pubkey_eq(ed_id, &chan->ed25519_identity));
 
-  tor_assert(!rsa_changed || !rsa_id_was_set);
-  tor_assert(!ed_changed || !ed_id_was_set);
+  if (BUG(rsa_changed && rsa_id_was_set))
+    return;
+  if (BUG(ed_changed && ed_id_was_set))
+    return;
 
   if (!rsa_changed && !ed_changed)
     return;
@@ -199,8 +205,7 @@ connection_or_set_identity_digest(or_connection_t *conn,
   memcpy(conn->identity_digest, rsa_digest, DIGEST_LEN);
 
   /* If we're initializing the IDs to zero, don't add a mapping yet. */
-  if (tor_digest_is_zero(rsa_digest) &&
-      (!ed_id || ed25519_public_key_is_zero(ed_id)))
+  if (tor_digest_is_zero(rsa_digest) && !new_ed_id_is_set)
     return;
 
   /* Deal with channels */
@@ -636,7 +641,7 @@ connection_or_flushed_some(or_connection_t *conn)
   /* If we're under the low water mark, add cells until we're just over the
    * high water mark. */
   datalen = connection_get_outbuf_len(TO_CONN(conn));
-  if (datalen < OR_CONN_LOWWATER) {
+  if (datalen < or_conn_lowwatermark()) {
     /* Let the scheduler know */
     scheduler_channel_wants_writes(TLS_CHAN_TO_BASE(conn->chan));
   }
@@ -660,9 +665,9 @@ connection_or_num_cells_writeable(or_connection_t *conn)
    * used to trigger when to start writing after we've stopped.
    */
   datalen = connection_get_outbuf_len(TO_CONN(conn));
-  if (datalen < OR_CONN_HIGHWATER) {
+  if (datalen < or_conn_highwatermark()) {
     cell_network_size = get_cell_network_size(conn->wide_circ_ids);
-    n = CEIL_DIV(OR_CONN_HIGHWATER - datalen, cell_network_size);
+    n = CEIL_DIV(or_conn_highwatermark() - datalen, cell_network_size);
   }
 
   return n;
@@ -805,6 +810,10 @@ connection_or_about_to_close(or_connection_t *or_conn)
   } else if (!tor_digest_is_zero(or_conn->identity_digest)) {
     connection_or_event_status(or_conn, OR_CONN_EVENT_CLOSED,
                 tls_error_to_orconn_end_reason(or_conn->tls_error));
+  } else {
+    /* Normal close, we notify of a done connection. */
+    connection_or_event_status(or_conn, OR_CONN_EVENT_CLOSED,
+                               END_OR_CONN_REASON_DONE);
   }
 }
 
@@ -1071,7 +1080,7 @@ connection_or_group_set_badness_(smartlist_t *group, int force)
    * XXXX connections. */
 
   or_connection_t *best = NULL;
-  int n_old = 0, n_inprogress = 0, n_canonical = 0, n_other = 0;
+  int n_canonical = 0;
   time_t now = time(NULL);
 
   /* Pass 1: expire everything that's old, and see what the status of
@@ -1080,14 +1089,8 @@ connection_or_group_set_badness_(smartlist_t *group, int force)
     if (connection_or_single_set_badness_(now, or_conn, force))
       continue;
 
-    if (connection_or_is_bad_for_new_circs(or_conn)) {
-      ++n_old;
-    } else if (or_conn->base_.state != OR_CONN_STATE_OPEN) {
-      ++n_inprogress;
-    } else if (or_conn->is_canonical) {
+    if (or_conn->is_canonical) {
       ++n_canonical;
-    } else {
-      ++n_other;
     }
   } SMARTLIST_FOREACH_END(or_conn);
 
@@ -1314,6 +1317,13 @@ note_or_connect_failed(const or_connection_t *or_conn)
   or_connect_failure_entry_t *ocf = NULL;
 
   tor_assert(or_conn);
+
+  if (or_conn->potentially_used_for_bootstrapping) {
+    /* Don't cache connection failures for connections we initiated ourself.
+     * If these direct connections fail, we're supposed to recognize that
+     * the destination is down and stop trying. See ticket 40499. */
+    return;
+  }
 
   ocf = or_connect_failure_find(or_conn);
   if (ocf == NULL) {

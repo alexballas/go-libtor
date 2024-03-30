@@ -13,6 +13,7 @@
 #include "app/config/config.h"
 #include "core/mainloop/connection.h"
 #include "feature/nodelist/networkstatus.h"
+#include "feature/relay/routermode.h"
 #define CHANNEL_OBJECT_PRIVATE
 #include "core/or/channel.h"
 #include "core/or/channeltls.h"
@@ -465,9 +466,17 @@ MOCK_IMPL(int, channel_should_write_to_kernel,
 MOCK_IMPL(void, channel_write_to_kernel, (channel_t *chan))
 {
   tor_assert(chan);
+
+  /* This is possible because a channel might have an outbuf table entry even
+   * though it has no more cells in its outbuf. Just move on. */
+  size_t outbuf_len = channel_outbuf_length(chan);
+  if (outbuf_len == 0) {
+    return;
+  }
+
   log_debug(LD_SCHED, "Writing %lu bytes to kernel for chan %" PRIu64,
-            (unsigned long)channel_outbuf_length(chan),
-            chan->global_identifier);
+            (unsigned long) outbuf_len, chan->global_identifier);
+
   /* Note that 'connection_handle_write()' may change the scheduler state of
    * the channel during the scheduling loop with
    * 'connection_or_flushed_some()' -> 'scheduler_channel_wants_writes()'.
@@ -802,12 +811,19 @@ kist_scheduler_run_interval(void)
 
   log_debug(LD_SCHED, "KISTSchedRunInterval=0, turning to the consensus.");
 
-  /* Will either be the consensus value or the default. Note that 0 can be
-   * returned which means the consensus wants us to NOT use KIST. */
-  return networkstatus_get_param(NULL, "KISTSchedRunInterval",
+  /* Clients and relays have a separate consensus parameter. Clients
+   * need a lower KIST interval, since they have only a couple connections */
+  if (server_mode(get_options())) {
+    return networkstatus_get_param(NULL, "KISTSchedRunInterval",
                                  KIST_SCHED_RUN_INTERVAL_DEFAULT,
                                  KIST_SCHED_RUN_INTERVAL_MIN,
                                  KIST_SCHED_RUN_INTERVAL_MAX);
+  } else {
+    return networkstatus_get_param(NULL, "KISTSchedRunIntervalClient",
+                                 KIST_SCHED_RUN_INTERVAL_DEFAULT,
+                                 KIST_SCHED_RUN_INTERVAL_MIN,
+                                 KIST_SCHED_RUN_INTERVAL_MAX);
+  }
 }
 
 /* Set KISTLite mode that is KIST without kernel support. */

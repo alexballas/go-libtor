@@ -44,6 +44,7 @@
 #include "core/or/circuitmux.h"
 #include "core/or/circuitmux_ewma.h"
 #include "core/or/command.h"
+#include "core/or/dos.h"
 #include "app/config/config.h"
 #include "app/config/resolve_addr.h"
 #include "core/mainloop/connection.h"
@@ -54,6 +55,7 @@
 #include "trunnel/link_handshake.h"
 #include "core/or/relay.h"
 #include "feature/stats/rephist.h"
+#include "feature/stats/geoip_stats.h"
 #include "feature/relay/router.h"
 #include "feature/relay/routermode.h"
 #include "feature/nodelist/dirlist.h"
@@ -64,6 +66,7 @@
 #include "trunnel/netinfo.h"
 #include "core/or/channelpadding.h"
 #include "core/or/extendinfo.h"
+#include "core/or/congestion_control_common.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/cell_queue_st.h"
@@ -356,6 +359,20 @@ channel_tls_handle_incoming(or_connection_t *orconn)
 
   /* Register it */
   channel_register(chan);
+
+  char *transport_name = NULL;
+  if (channel_tls_get_transport_name_method(TLS_CHAN_TO_BASE(orconn->chan),
+        &transport_name) < 0) {
+    transport_name = NULL;
+  }
+  /* Start tracking TLS connections in the DoS subsystem as soon as possible,
+   * so we can protect against attacks that use partially open connections.
+   */
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT,
+                         &TO_CONN(orconn)->addr, transport_name,
+                         time(NULL));
+  dos_new_client_conn(orconn, transport_name);
+  tor_free(transport_name);
 
   return chan;
 }
@@ -793,7 +810,7 @@ channel_tls_num_cells_writeable_method(channel_t *chan)
   cell_network_size = get_cell_network_size(tlschan->conn->wide_circ_ids);
   outbuf_len = connection_get_outbuf_len(TO_CONN(tlschan->conn));
   /* Get the number of cells */
-  n = CEIL_DIV(OR_CONN_HIGHWATER - outbuf_len, cell_network_size);
+  n = CEIL_DIV(or_conn_highwatermark() - outbuf_len, cell_network_size);
   if (n < 0) n = 0;
 #if SIZEOF_SIZE_T > SIZEOF_INT
   if (n > INT_MAX) n = INT_MAX;

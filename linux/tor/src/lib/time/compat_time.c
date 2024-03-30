@@ -253,11 +253,14 @@ monotime_init_internal(void)
   tor_assert(mach_time_info.denom != 0);
 
   {
-    // approximate only.
-    uint64_t ns_per_tick = mach_time_info.numer / mach_time_info.denom;
-    uint64_t ms_per_tick = ns_per_tick * ONE_MILLION;
+    // We want to compute this, approximately:
+    //   uint64_t ns_per_tick = mach_time_info.numer / mach_time_info.denom;
+    //   uint64_t ticks_per_ms = ONE_MILLION / ns_per_tick;
+    // This calculation multiplies first, though, to improve accuracy.
+    uint64_t ticks_per_ms = (ONE_MILLION * mach_time_info.denom)
+      / mach_time_info.numer;
     // requires that tor_log2(0) == 0.
-    monotime_shift = tor_log2(ms_per_tick);
+    monotime_shift = tor_log2(ticks_per_ms);
   }
   {
     // For converting ticks to milliseconds in a 32-bit-friendly way, we
@@ -809,6 +812,12 @@ monotime_absolute_msec(void)
   return monotime_absolute_nsec() / ONE_MILLION;
 }
 
+uint64_t
+monotime_absolute_sec(void)
+{
+  return monotime_absolute_nsec() / ONE_BILLION;
+}
+
 #ifdef MONOTIME_COARSE_FN_IS_DIFFERENT
 uint64_t
 monotime_coarse_absolute_nsec(void)
@@ -832,6 +841,17 @@ uint64_t
 monotime_coarse_absolute_msec(void)
 {
   return monotime_coarse_absolute_nsec() / ONE_MILLION;
+}
+
+uint64_t
+monotime_coarse_absolute_sec(void)
+{
+  /* Note: Right now I'm not too concerned about 64-bit division, but if this
+   * ever becomes a hotspot we need to optimize, we can modify this to grab
+   * tv_sec directly from CLOCK_MONOTONIC_COARSE on linux at least. Right now
+   * I'm choosing to make this simpler and easier to test, but this
+   * optimization is available easily if we need it. */
+  return monotime_coarse_absolute_nsec() / ONE_BILLION;
 }
 #else /* !defined(MONOTIME_COARSE_FN_IS_DIFFERENT) */
 #define initialized_at_coarse initialized_at

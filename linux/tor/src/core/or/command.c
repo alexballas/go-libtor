@@ -360,15 +360,19 @@ command_process_create_cell(cell_t *cell, channel_t *chan)
     uint8_t rend_circ_nonce[DIGEST_LEN];
     int len;
     created_cell_t created_cell;
+    circuit_params_t params;
 
     memset(&created_cell, 0, sizeof(created_cell));
     len = onion_skin_server_handshake(ONION_HANDSHAKE_TYPE_FAST,
                                        create_cell->onionskin,
                                        create_cell->handshake_len,
                                        NULL,
+                                       NULL,
                                        created_cell.reply,
+                                       sizeof(created_cell.reply),
                                        keys, CPATH_KEY_MATERIAL_LEN,
-                                       rend_circ_nonce);
+                                       rend_circ_nonce,
+                                       &params);
     tor_free(create_cell);
     if (len < 0) {
       log_warn(LD_OR,"Failed to generate key material. Closing.");
@@ -563,7 +567,7 @@ command_process_relay_cell(cell_t *cell, channel_t *chan)
   }
 
   if ((reason = circuit_receive_relay_cell(cell, circ, direction)) < 0) {
-    log_fn(LOG_PROTOCOL_WARN,LD_PROTOCOL,"circuit_receive_relay_cell "
+    log_fn(LOG_DEBUG,LD_PROTOCOL,"circuit_receive_relay_cell "
            "(%s) failed. Closing.",
            direction==CELL_DIRECTION_OUT?"forward":"backward");
     /* Always emit a bandwidth event for closed circs */
@@ -652,19 +656,22 @@ command_process_destroy_cell(cell_t *cell, channel_t *chan)
   if (!CIRCUIT_IS_ORIGIN(circ) &&
       chan == TO_OR_CIRCUIT(circ)->p_chan &&
       cell->circ_id == TO_OR_CIRCUIT(circ)->p_circ_id) {
-    /* the destroy came from behind */
+    /* The destroy came from behind so nullify its p_chan. Close the circuit
+     * with a DESTROYED reason so we don't propagate along the path forward the
+     * reason which could be used as a side channel. */
     circuit_set_p_circid_chan(TO_OR_CIRCUIT(circ), 0, NULL);
-    circuit_mark_for_close(circ, reason|END_CIRC_REASON_FLAG_REMOTE);
+    circuit_mark_for_close(circ, END_CIRC_REASON_DESTROYED);
   } else { /* the destroy came from ahead */
     circuit_set_n_circid_chan(circ, 0, NULL);
     if (CIRCUIT_IS_ORIGIN(circ)) {
       circuit_mark_for_close(circ, reason|END_CIRC_REASON_FLAG_REMOTE);
     } else {
-      char payload[1];
-      log_debug(LD_OR, "Delivering 'truncated' back.");
-      payload[0] = (char)reason;
-      relay_send_command_from_edge(0, circ, RELAY_COMMAND_TRUNCATED,
-                                   payload, sizeof(payload), NULL);
+      /* Close the circuit so we stop queuing cells for it and propagate the
+       * DESTROY cell down the circuit so relays can stop queuing in-flight
+       * cells for this circuit which helps with memory pressure. We do NOT
+       * propagate the remote reason so not to create a side channel. */
+      log_debug(LD_OR, "Received DESTROY cell from n_chan, closing circuit.");
+      circuit_mark_for_close(circ, END_CIRC_REASON_DESTROYED);
     }
   }
 }

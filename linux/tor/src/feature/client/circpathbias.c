@@ -334,12 +334,23 @@ pathbias_should_count(origin_circuit_t *circ)
    * endpoint could be chosen maliciously.
    * Similarly, we can't count client-side intro attempts,
    * because clients can be manipulated into connecting to
-   * malicious intro points. */
+   * malicious intro points.
+   *
+   * Finally, avoid counting conflux circuits for now, because
+   * a malicious exit could cause us to reconnect and blame
+   * our guard...
+   *
+   * TODO-329-PURPOSE: This is not quite right, we could
+   * instead avoid sending usable probes on conflux circs,
+   * and count only linked circs as failures, but it is
+   * not 100% clear that would result in accurate counts. */
   if (get_options()->UseEntryGuards == 0 ||
           circ->base_.purpose == CIRCUIT_PURPOSE_TESTING ||
           circ->base_.purpose == CIRCUIT_PURPOSE_CONTROLLER ||
           circ->base_.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND ||
           circ->base_.purpose == CIRCUIT_PURPOSE_S_REND_JOINED ||
+          circ->base_.purpose == CIRCUIT_PURPOSE_CONFLUX_UNLINKED ||
+          circ->base_.purpose == CIRCUIT_PURPOSE_CONFLUX_LINKED ||
           (circ->base_.purpose >= CIRCUIT_PURPOSE_C_INTRODUCING &&
            circ->base_.purpose <= CIRCUIT_PURPOSE_C_INTRODUCE_ACKED)) {
 
@@ -359,6 +370,17 @@ pathbias_should_count(origin_circuit_t *circ)
                circuit_purpose_to_string(circ->base_.purpose),
                pathbias_state_to_string(circ->path_state));
     }
+    circ->pathbias_shouldcount = PATHBIAS_SHOULDCOUNT_IGNORED;
+    return 0;
+  }
+
+  /* Ignore circuits where the controller helped choose the path.  When
+   * this happens, we can't be sure whether the path was chosen randomly
+   * or not. */
+  if (circ->any_hop_from_controller) {
+    /* (In this case, we _don't_ check to see if shouldcount is changing,
+     * since it's possible that an already-created circuit later gets extended
+     * by the controller. */
     circ->pathbias_shouldcount = PATHBIAS_SHOULDCOUNT_IGNORED;
     return 0;
   }

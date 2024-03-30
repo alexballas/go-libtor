@@ -78,6 +78,8 @@
 #include "core/crypto/relay_crypto.h"
 #include "feature/nodelist/nodelist.h"
 
+#include "src/core/or/conflux_util.h"
+
 #include "app/config/config.h"
 
 static inline circpad_circuit_state_t circpad_circuit_state(
@@ -251,8 +253,11 @@ circpad_marked_circuit_for_padding(circuit_t *circ, int reason)
      * has shut down, but using the MaxCircuitDirtiness timer instead of
      * the idle circuit timer (again, we want this because we're not
      * supposed to look idle to Guard nodes that can see our lifespan). */
-    if (!circ->timestamp_dirty)
+    if (!circ->timestamp_dirty) {
       circ->timestamp_dirty = approx_time();
+      if (circ->conflux && CIRCUIT_IS_ORIGIN(circ))
+        conflux_sync_circ_fields(circ->conflux, TO_ORIGIN_CIRCUIT(circ));
+    }
 
     /* Take ownership of the circuit */
     circuit_change_purpose(circ, CIRCUIT_PURPOSE_C_CIRCUIT_PADDING);
@@ -2967,6 +2972,8 @@ signed_error_t
 circpad_handle_padding_negotiate(circuit_t *circ, cell_t *cell)
 {
   int retval = 0;
+  /* Should we send back a STOP cell? */
+  bool respond_with_stop = true;
   circpad_negotiate_t *negotiate;
 
   if (CIRCUIT_IS_ORIGIN(circ)) {
@@ -2992,6 +2999,12 @@ circpad_handle_padding_negotiate(circuit_t *circ, cell_t *cell)
                negotiate->machine_type, negotiate->machine_ctr);
       goto done;
     }
+
+    /* If we reached this point we received a STOP command from an old or
+       unknown machine. Don't reply with our own STOP since there is no one to
+       handle it on the other end */
+    respond_with_stop = false;
+
     if (negotiate->machine_ctr <= circ->padding_machine_ctr) {
       log_info(LD_CIRC, "Received STOP command for old machine %u, ctr %u",
                negotiate->machine_type, negotiate->machine_ctr);
@@ -3023,10 +3036,13 @@ circpad_handle_padding_negotiate(circuit_t *circ, cell_t *cell)
     retval = -1;
 
   done:
-    circpad_padding_negotiated(circ, negotiate->machine_type,
-                   negotiate->command,
-                   (retval == 0) ? CIRCPAD_RESPONSE_OK : CIRCPAD_RESPONSE_ERR,
-                   negotiate->machine_ctr);
+    if (respond_with_stop) {
+      circpad_padding_negotiated(circ, negotiate->machine_type,
+                    negotiate->command,
+                    (retval == 0) ? CIRCPAD_RESPONSE_OK : CIRCPAD_RESPONSE_ERR,
+                    negotiate->machine_ctr);
+    }
+
     circpad_negotiate_free(negotiate);
 
     return retval;

@@ -11,6 +11,7 @@
 #include "orconfig.h"
 
 #include "lib/log/util_bug.h"
+#include "lib/string/printf.h"
 
 #include "lib/metrics/metrics_common.h"
 
@@ -23,7 +24,21 @@ metrics_type_to_str(const metrics_type_t type)
     return "counter";
   case METRICS_TYPE_GAUGE:
     return "gauge";
+  case METRICS_TYPE_HISTOGRAM:
+    return "histogram";
   default:
     tor_assert_unreached();
   }
+}
+
+/** Return a static buffer pointer that contains a formatted label on the form
+ * of key=value.
+ *
+ * Subsequent call to this function invalidates the previous buffer. */
+const char *
+metrics_format_label(const char *key, const char *value)
+{
+  static char buf[128];
+  tor_snprintf(buf, sizeof(buf), "%s=\"%s\"", key, value);
+  return buf;
 }

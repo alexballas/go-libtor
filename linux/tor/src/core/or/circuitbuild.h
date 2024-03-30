@@ -24,6 +24,12 @@ origin_circuit_t *origin_circuit_init(uint8_t purpose, int flags);
 origin_circuit_t *circuit_establish_circuit(uint8_t purpose,
                                             extend_info_t *exit,
                                             int flags);
+MOCK_DECL(origin_circuit_t *, circuit_establish_circuit_conflux, (
+                                            const uint8_t *nonce,
+                                            uint8_t purpose,
+                                            extend_info_t *exit,
+                                            int flags));
+
 struct circuit_guard_state_t *origin_circuit_get_guard_state(
                                             origin_circuit_t *circ);
 int circuit_handle_first_hop(origin_circuit_t *circ);
@@ -51,7 +57,8 @@ const char *build_state_get_exit_nickname(cpath_build_state_t *state);
 
 struct circuit_guard_state_t;
 
-const node_t *choose_good_entry_server(uint8_t purpose,
+const node_t *choose_good_entry_server(const origin_circuit_t *circ,
+                           uint8_t purpose,
                            cpath_build_state_t *state,
                            struct circuit_guard_state_t **guard_state_out);
 void circuit_upgrade_circuits_from_guard_wait(void);
@@ -63,6 +70,10 @@ MOCK_DECL(int,
 circuit_deliver_create_cell,(circuit_t *circ,
                              const struct create_cell_t *create_cell,
                              int relayed));
+
+int client_circ_negotiation_message(const extend_info_t *ei,
+                                    uint8_t **msg_out,
+                                    size_t *msg_len_out);
 
 #ifdef CIRCUITBUILD_PRIVATE
 STATIC circid_t get_unique_circ_id_by_chan(channel_t *chan);

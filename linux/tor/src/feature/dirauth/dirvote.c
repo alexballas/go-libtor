@@ -390,7 +390,8 @@ format_networkstatus_vote(crypto_pk_t *private_signing_key,
     rsf = routerstatus_format_entry(&vrs->status,
                                     vrs->version, vrs->protocols,
                                     NS_V3_VOTE,
-                                    vrs);
+                                    vrs,
+                                    -1);
     if (rsf)
       smartlist_add(chunks, rsf);
 
@@ -618,8 +619,8 @@ compare_vote_rs(const vote_routerstatus_t *a, const vote_routerstatus_t *b)
    * the descriptor digests matched, so somebody is making SHA1 collisions.
    */
 #define CMP_FIELD(utype, itype, field) do {                             \
-    utype aval = (utype) (itype) a->status.field;                       \
-    utype bval = (utype) (itype) b->status.field;                       \
+    utype aval = (utype) (itype) a->field;                              \
+    utype bval = (utype) (itype) b->field;                              \
     utype u = bval - aval;                                              \
     itype r2 = (itype) u;                                               \
     if (r2 < 0) {                                                       \
@@ -638,8 +639,8 @@ compare_vote_rs(const vote_routerstatus_t *a, const vote_routerstatus_t *b)
                             CMP_EXACT))) {
     return r;
   }
-  CMP_FIELD(unsigned, int, ipv4_orport);
-  CMP_FIELD(unsigned, int, ipv4_dirport);
+  CMP_FIELD(unsigned, int, status.ipv4_orport);
+  CMP_FIELD(unsigned, int, status.ipv4_dirport);
 
   return 0;
 }
@@ -692,10 +693,10 @@ compute_routerstatus_consensus(smartlist_t *votes, int consensus_method,
     } else {
       if (cur && (cur_n > most_n ||
                   (cur_n == most_n &&
-                   cur->status.published_on > most_published))) {
+                   cur->published_on > most_published))) {
         most = cur;
         most_n = cur_n;
-        most_published = cur->status.published_on;
+        most_published = cur->published_on;
       }
       cur_n = 1;
       cur = rs;
@@ -703,7 +704,7 @@ compute_routerstatus_consensus(smartlist_t *votes, int consensus_method,
   } SMARTLIST_FOREACH_END(rs);
 
   if (cur_n > most_n ||
-      (cur && cur_n == most_n && cur->status.published_on > most_published)) {
+      (cur && cur_n == most_n && cur->published_on > most_published)) {
     most = cur;
     // most_n = cur_n; // unused after this point.
     // most_published = cur->status.published_on; // unused after this point.
@@ -1479,6 +1480,21 @@ compute_nth_protocol_set(int n, int n_voters, const smartlist_t *votes)
   return result;
 }
 
+/** Helper: Takes a smartlist of `const char *` flags, and a flag to remove.
+ *
+ * Removes that flag if it is present in the list.  Doesn't free it.
+ */
+static void
+remove_flag(smartlist_t *sl, const char *flag)
+{
+  /* We can't use smartlist_string_remove() here, since that doesn't preserve
+   * order, and since it frees elements from the string. */
+
+  int idx = smartlist_string_pos(sl, flag);
+  if (idx >= 0)
+    smartlist_del_keeporder(sl, idx);
+}
+
 /** Given a list of vote networkstatus_t in <b>votes</b>, our public
  * authority <b>identity_key</b>, our private authority <b>signing_key</b>,
  * and the number of <b>total_authorities</b> that we believe exist in our
@@ -1633,6 +1649,9 @@ networkstatus_compute_consensus(smartlist_t *votes,
     tor_free(votesec_list);
     tor_free(distsec_list);
   }
+  // True if anybody is voting on the BadExit flag.
+  const bool badexit_flag_is_listed =
+    smartlist_contains_string(flags, "BadExit");
 
   chunks = smartlist_new();
 
@@ -1762,7 +1781,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
                   params, "maxunmeasuredbw", DEFAULT_MAX_UNMEASURED_BW_KB);
     } else {
       max_unmeasured_bw_kb = dirvote_get_intermediate_param_value(
-                  param_list, "maxunmeasurdbw", DEFAULT_MAX_UNMEASURED_BW_KB);
+                  param_list, "maxunmeasuredbw", DEFAULT_MAX_UNMEASURED_BW_KB);
       if (max_unmeasured_bw_kb < 1)
         max_unmeasured_bw_kb = 1;
     }
@@ -1924,7 +1943,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       const char *chosen_name = NULL;
       int exitsummary_disagreement = 0;
       int is_named = 0, is_unnamed = 0, is_running = 0, is_valid = 0;
-      int is_guard = 0, is_exit = 0, is_bad_exit = 0;
+      int is_guard = 0, is_exit = 0, is_bad_exit = 0, is_middle_only = 0;
       int naming_conflict = 0;
       int n_listing = 0;
       char microdesc_digest[DIGEST256_LEN];
@@ -2029,13 +2048,27 @@ networkstatus_compute_consensus(smartlist_t *votes,
       memcpy(rs_out.descriptor_digest, rs->status.descriptor_digest,
              DIGEST_LEN);
       tor_addr_copy(&rs_out.ipv4_addr, &rs->status.ipv4_addr);
-      rs_out.published_on = rs->status.published_on;
       rs_out.ipv4_dirport = rs->status.ipv4_dirport;
       rs_out.ipv4_orport = rs->status.ipv4_orport;
       tor_addr_copy(&rs_out.ipv6_addr, &alt_orport.addr);
       rs_out.ipv6_orport = alt_orport.port;
       rs_out.has_bandwidth = 0;
       rs_out.has_exitsummary = 0;
+
+      time_t published_on = rs->published_on;
+
+      /* Starting with this consensus method, we no longer include a
+         meaningful published_on time for microdescriptor consensuses.  This
+         makes their diffs smaller and more compressible.
+
+         We need to keep including a meaningful published_on time for NS
+         consensuses, however, until 035 relays are all obsolete. (They use
+         it for a purpose similar to the current StaleDesc flag.)
+      */
+      if (consensus_method >= MIN_METHOD_TO_SUPPRESS_MD_PUBLISHED &&
+          flavor == FLAV_MICRODESC) {
+        published_on = -1;
+      }
 
       if (chosen_name && !naming_conflict) {
         strlcpy(rs_out.nickname, chosen_name, sizeof(rs_out.nickname));
@@ -2055,7 +2088,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
       }
 
       /* Set the flags. */
-      smartlist_add(chosen_flags, (char*)"s"); /* for the start of the line. */
       SMARTLIST_FOREACH_BEGIN(flags, const char *, fl) {
         if (!strcmp(fl, "Named")) {
           if (is_named)
@@ -2077,6 +2109,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
               is_running = 1;
             else if (!strcmp(fl, "BadExit"))
               is_bad_exit = 1;
+            else if (!strcmp(fl, "MiddleOnly"))
+              is_middle_only = 1;
             else if (!strcmp(fl, "Valid"))
               is_valid = 1;
           }
@@ -2092,6 +2126,22 @@ networkstatus_compute_consensus(smartlist_t *votes,
        * that are not valid in a consensus.  See Proposal 272 */
       if (!is_valid)
         continue;
+
+      /* Starting with consensus method 32, we handle the middle-only
+       * flag specially: when it is present, we clear some flags, and
+       * set others. */
+      if (is_middle_only && consensus_method >= MIN_METHOD_FOR_MIDDLEONLY) {
+        remove_flag(chosen_flags, "Exit");
+        remove_flag(chosen_flags, "V2Dir");
+        remove_flag(chosen_flags, "Guard");
+        remove_flag(chosen_flags, "HSDir");
+        is_exit = is_guard = 0;
+        if (! is_bad_exit && badexit_flag_is_listed) {
+          is_bad_exit = 1;
+          smartlist_add(chosen_flags, (char *)"BadExit");
+          smartlist_sort_strings(chosen_flags); // restore order.
+        }
+      }
 
       /* Pick the version. */
       if (smartlist_len(versions)) {
@@ -2241,7 +2291,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
         /* Okay!! Now we can write the descriptor... */
         /*     First line goes into "buf". */
         buf = routerstatus_format_entry(&rs_out, NULL, NULL,
-                                        rs_format, NULL);
+                                        rs_format, NULL, published_on);
         if (buf)
           smartlist_add(chunks, buf);
       }
@@ -2253,6 +2303,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
         smartlist_add_asprintf(chunks, "m %s\n", m);
       }
       /*     Next line is all flags.  The "\n" is missing. */
+      smartlist_add_asprintf(chunks, "s%s",
+                             smartlist_len(chosen_flags)?" ":"");
       smartlist_add(chunks,
                     smartlist_join_strings(chosen_flags, " ", 0, NULL));
       /*     Now the version line. */
@@ -4581,6 +4633,7 @@ const char DIRVOTE_UNIVERSAL_FLAGS[] =
  * depending on our configuration. */
 const char DIRVOTE_OPTIONAL_FLAGS[] =
   "BadExit "
+  "MiddleOnly "
   "Running";
 
 /** Return a new networkstatus_t* containing our current opinion. (For v3
@@ -4598,7 +4651,8 @@ dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
   smartlist_t *routers, *routerstatuses;
   char identity_digest[DIGEST_LEN];
   char signing_key_digest[DIGEST_LEN];
-  const int listbadexits = d_options->AuthDirListBadExits;
+  const int list_bad_exits = d_options->AuthDirListBadExits;
+  const int list_middle_only = d_options->AuthDirListMiddleOnly;
   routerlist_t *rl = router_get_routerlist();
   time_t now = time(NULL);
   time_t cutoff = now - ROUTER_MAX_AGE_TO_PUBLISH;
@@ -4703,7 +4757,9 @@ dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
       vrs = tor_malloc_zero(sizeof(vote_routerstatus_t));
       rs = &vrs->status;
       dirauth_set_routerstatus_from_routerinfo(rs, node, ri, now,
-                                               listbadexits);
+                                               list_bad_exits,
+                                               list_middle_only);
+      vrs->published_on = ri->cache_info.published_on;
 
       if (ri->cache_info.signing_key_cert) {
         memcpy(vrs->ed25519_id,
@@ -4825,8 +4881,10 @@ dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
                          0, SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
   if (vote_on_reachability)
     smartlist_add_strdup(v3_out->known_flags, "Running");
-  if (listbadexits)
+  if (list_bad_exits)
     smartlist_add_strdup(v3_out->known_flags, "BadExit");
+  if (list_middle_only)
+    smartlist_add_strdup(v3_out->known_flags, "MiddleOnly");
   smartlist_sort_strings(v3_out->known_flags);
 
   if (d_options->ConsensusParams) {
@@ -4836,6 +4894,14 @@ dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
       smartlist_split_string(v3_out->net_params,
                              paramline->value, NULL, 0, 0);
     }
+
+    /* for transparency and visibility, include our current value of
+     * AuthDirMaxServersPerAddr in our consensus params. Once enough dir
+     * auths do this, external tools should be able to use that value to
+     * help understand which relays are allowed into the consensus. */
+    smartlist_add_asprintf(v3_out->net_params, "AuthDirMaxServersPerAddr=%d",
+                           d_options->AuthDirMaxServersPerAddr);
+
     smartlist_sort_strings(v3_out->net_params);
   }
   v3_out->bw_file_headers = bw_file_headers;

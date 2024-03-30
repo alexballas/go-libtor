@@ -185,17 +185,26 @@ struct curve25519_public_key_t;
 #define RELAY_COMMAND_DATA 2
 #define RELAY_COMMAND_END 3
 #define RELAY_COMMAND_CONNECTED 4
+
 #define RELAY_COMMAND_SENDME 5
 #define RELAY_COMMAND_EXTEND 6
 #define RELAY_COMMAND_EXTENDED 7
 #define RELAY_COMMAND_TRUNCATE 8
 #define RELAY_COMMAND_TRUNCATED 9
 #define RELAY_COMMAND_DROP 10
+
 #define RELAY_COMMAND_RESOLVE 11
 #define RELAY_COMMAND_RESOLVED 12
+
 #define RELAY_COMMAND_BEGIN_DIR 13
 #define RELAY_COMMAND_EXTEND2 14
 #define RELAY_COMMAND_EXTENDED2 15
+
+/* Conflux */
+#define RELAY_COMMAND_CONFLUX_LINK 19
+#define RELAY_COMMAND_CONFLUX_LINKED 20
+#define RELAY_COMMAND_CONFLUX_LINKED_ACK 21
+#define RELAY_COMMAND_CONFLUX_SWITCH 22
 
 #define RELAY_COMMAND_ESTABLISH_INTRO 32
 #define RELAY_COMMAND_ESTABLISH_RENDEZVOUS 33
@@ -209,6 +218,9 @@ struct curve25519_public_key_t;
 
 #define RELAY_COMMAND_PADDING_NEGOTIATE 41
 #define RELAY_COMMAND_PADDING_NEGOTIATED 42
+
+#define RELAY_COMMAND_XOFF 43
+#define RELAY_COMMAND_XON 44
 
 /* Reasons why an OR connection is closed. */
 #define END_OR_CONN_REASON_DONE           1
@@ -433,10 +445,6 @@ typedef enum {
 #define LEGAL_NICKNAME_CHARACTERS \
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-/** Name to use in client TLS certificates if no nickname is given. Once
- * Tor 0.1.2.x is obsolete, we can remove this. */
-#define DEFAULT_CLIENT_NICKNAME "client"
-
 /** Name chosen by routers that don't configure nicknames */
 #define UNNAMED_ROUTER_NICKNAME "Unnamed"
 
@@ -591,18 +599,6 @@ typedef struct or_handshake_state_t or_handshake_state_t;
 
 /** Length of Extended ORPort connection identifier. */
 #define EXT_OR_CONN_ID_LEN DIGEST_LEN /* 20 */
-/*
- * OR_CONN_HIGHWATER and OR_CONN_LOWWATER moved from connection_or.c so
- * channeltls.c can see them too.
- */
-
-/** When adding cells to an OR connection's outbuf, keep adding until the
- * outbuf is at least this long, or we run out of cells. */
-#define OR_CONN_HIGHWATER (32*1024)
-
-/** Add cells to an OR connection's outbuf whenever the outbuf's data length
- * drops below this size. */
-#define OR_CONN_LOWWATER (16*1024)
 
 typedef struct connection_t connection_t;
 typedef struct control_connection_t control_connection_t;
@@ -741,6 +737,12 @@ typedef struct protover_summary_flags_t {
    * negotiate hs circuit setup padding. Requires Padding=2. */
   unsigned int supports_hs_setup_padding : 1;
 
+  /** True iff this router supports congestion control.
+   * Requires both FlowCtrl=2 *and* Relay=4 */
+  unsigned int supports_congestion_control : 1;
+
+  /** True iff this router supports conflux. Requires Relay=5 */
+  unsigned int supports_conflux : 1;
 } protover_summary_flags_t;
 
 typedef struct routerinfo_t routerinfo_t;
@@ -799,7 +801,8 @@ typedef enum {
 #define ONION_HANDSHAKE_TYPE_TAP  0x0000
 #define ONION_HANDSHAKE_TYPE_FAST 0x0001
 #define ONION_HANDSHAKE_TYPE_NTOR 0x0002
-#define MAX_ONION_HANDSHAKE_TYPE 0x0002
+#define ONION_HANDSHAKE_TYPE_NTOR_V3 0x0003
+#define MAX_ONION_HANDSHAKE_TYPE 0x0003
 
 typedef struct onion_handshake_state_t onion_handshake_state_t;
 typedef struct relay_crypto_t relay_crypto_t;

@@ -28,14 +28,14 @@ int cellintroduce_deadcode_dummy__ = 0;
     }                                                            \
   } while (0)
 
-typedef struct trn_cell_extension_st trn_cell_extension_t;
-trn_cell_extension_t *trn_cell_extension_new(void);
-void trn_cell_extension_free(trn_cell_extension_t *victim);
-ssize_t trn_cell_extension_parse(trn_cell_extension_t **output, const uint8_t *input, const size_t len_in);
-ssize_t trn_cell_extension_encoded_len(const trn_cell_extension_t *obj);
-ssize_t trn_cell_extension_encode(uint8_t *output, size_t avail, const trn_cell_extension_t *input);
-const char *trn_cell_extension_check(const trn_cell_extension_t *obj);
-int trn_cell_extension_clear_errors(trn_cell_extension_t *obj);
+typedef struct trn_extension_st trn_extension_t;
+trn_extension_t *trn_extension_new(void);
+void trn_extension_free(trn_extension_t *victim);
+ssize_t trn_extension_parse(trn_extension_t **output, const uint8_t *input, const size_t len_in);
+ssize_t trn_extension_encoded_len(const trn_extension_t *obj);
+ssize_t trn_extension_encode(uint8_t *output, size_t avail, const trn_extension_t *input);
+const char *trn_extension_check(const trn_extension_t *obj);
+int trn_extension_clear_errors(trn_extension_t *obj);
 typedef struct link_specifier_st link_specifier_t;
 link_specifier_t *link_specifier_new(void);
 void link_specifier_free(link_specifier_t *victim);
@@ -44,6 +44,350 @@ ssize_t link_specifier_encoded_len(const link_specifier_t *obj);
 ssize_t link_specifier_encode(uint8_t *output, size_t avail, const link_specifier_t *input);
 const char *link_specifier_check(const link_specifier_t *obj);
 int link_specifier_clear_errors(link_specifier_t *obj);
+trn_cell_extension_pow_t *
+trn_cell_extension_pow_new(void)
+{
+  trn_cell_extension_pow_t *val = trunnel_calloc(1, sizeof(trn_cell_extension_pow_t));
+  if (NULL == val)
+    return NULL;
+  val->pow_version = 1;
+  return val;
+}
+
+/** Release all storage held inside 'obj', but do not free 'obj'.
+ */
+static void
+trn_cell_extension_pow_clear(trn_cell_extension_pow_t *obj)
+{
+  (void) obj;
+}
+
+void
+trn_cell_extension_pow_free(trn_cell_extension_pow_t *obj)
+{
+  if (obj == NULL)
+    return;
+  trn_cell_extension_pow_clear(obj);
+  trunnel_memwipe(obj, sizeof(trn_cell_extension_pow_t));
+  trunnel_free_(obj);
+}
+
+uint8_t
+trn_cell_extension_pow_get_pow_version(const trn_cell_extension_pow_t *inp)
+{
+  return inp->pow_version;
+}
+int
+trn_cell_extension_pow_set_pow_version(trn_cell_extension_pow_t *inp, uint8_t val)
+{
+  if (! ((val == 1))) {
+     TRUNNEL_SET_ERROR_CODE(inp);
+     return -1;
+  }
+  inp->pow_version = val;
+  return 0;
+}
+size_t
+trn_cell_extension_pow_getlen_pow_nonce(const trn_cell_extension_pow_t *inp)
+{
+  (void)inp;  return TRUNNEL_POW_NONCE_LEN;
+}
+
+uint8_t
+trn_cell_extension_pow_get_pow_nonce(trn_cell_extension_pow_t *inp, size_t idx)
+{
+  trunnel_assert(idx < TRUNNEL_POW_NONCE_LEN);
+  return inp->pow_nonce[idx];
+}
+
+uint8_t
+trn_cell_extension_pow_getconst_pow_nonce(const trn_cell_extension_pow_t *inp, size_t idx)
+{
+  return trn_cell_extension_pow_get_pow_nonce((trn_cell_extension_pow_t*)inp, idx);
+}
+int
+trn_cell_extension_pow_set_pow_nonce(trn_cell_extension_pow_t *inp, size_t idx, uint8_t elt)
+{
+  trunnel_assert(idx < TRUNNEL_POW_NONCE_LEN);
+  inp->pow_nonce[idx] = elt;
+  return 0;
+}
+
+uint8_t *
+trn_cell_extension_pow_getarray_pow_nonce(trn_cell_extension_pow_t *inp)
+{
+  return inp->pow_nonce;
+}
+const uint8_t  *
+trn_cell_extension_pow_getconstarray_pow_nonce(const trn_cell_extension_pow_t *inp)
+{
+  return (const uint8_t  *)trn_cell_extension_pow_getarray_pow_nonce((trn_cell_extension_pow_t*)inp);
+}
+uint32_t
+trn_cell_extension_pow_get_pow_effort(const trn_cell_extension_pow_t *inp)
+{
+  return inp->pow_effort;
+}
+int
+trn_cell_extension_pow_set_pow_effort(trn_cell_extension_pow_t *inp, uint32_t val)
+{
+  inp->pow_effort = val;
+  return 0;
+}
+size_t
+trn_cell_extension_pow_getlen_pow_seed(const trn_cell_extension_pow_t *inp)
+{
+  (void)inp;  return TRUNNEL_POW_SEED_HEAD_LEN;
+}
+
+uint8_t
+trn_cell_extension_pow_get_pow_seed(trn_cell_extension_pow_t *inp, size_t idx)
+{
+  trunnel_assert(idx < TRUNNEL_POW_SEED_HEAD_LEN);
+  return inp->pow_seed[idx];
+}
+
+uint8_t
+trn_cell_extension_pow_getconst_pow_seed(const trn_cell_extension_pow_t *inp, size_t idx)
+{
+  return trn_cell_extension_pow_get_pow_seed((trn_cell_extension_pow_t*)inp, idx);
+}
+int
+trn_cell_extension_pow_set_pow_seed(trn_cell_extension_pow_t *inp, size_t idx, uint8_t elt)
+{
+  trunnel_assert(idx < TRUNNEL_POW_SEED_HEAD_LEN);
+  inp->pow_seed[idx] = elt;
+  return 0;
+}
+
+uint8_t *
+trn_cell_extension_pow_getarray_pow_seed(trn_cell_extension_pow_t *inp)
+{
+  return inp->pow_seed;
+}
+const uint8_t  *
+trn_cell_extension_pow_getconstarray_pow_seed(const trn_cell_extension_pow_t *inp)
+{
+  return (const uint8_t  *)trn_cell_extension_pow_getarray_pow_seed((trn_cell_extension_pow_t*)inp);
+}
+size_t
+trn_cell_extension_pow_getlen_pow_solution(const trn_cell_extension_pow_t *inp)
+{
+  (void)inp;  return TRUNNEL_POW_SOLUTION_LEN;
+}
+
+uint8_t
+trn_cell_extension_pow_get_pow_solution(trn_cell_extension_pow_t *inp, size_t idx)
+{
+  trunnel_assert(idx < TRUNNEL_POW_SOLUTION_LEN);
+  return inp->pow_solution[idx];
+}
+
+uint8_t
+trn_cell_extension_pow_getconst_pow_solution(const trn_cell_extension_pow_t *inp, size_t idx)
+{
+  return trn_cell_extension_pow_get_pow_solution((trn_cell_extension_pow_t*)inp, idx);
+}
+int
+trn_cell_extension_pow_set_pow_solution(trn_cell_extension_pow_t *inp, size_t idx, uint8_t elt)
+{
+  trunnel_assert(idx < TRUNNEL_POW_SOLUTION_LEN);
+  inp->pow_solution[idx] = elt;
+  return 0;
+}
+
+uint8_t *
+trn_cell_extension_pow_getarray_pow_solution(trn_cell_extension_pow_t *inp)
+{
+  return inp->pow_solution;
+}
+const uint8_t  *
+trn_cell_extension_pow_getconstarray_pow_solution(const trn_cell_extension_pow_t *inp)
+{
+  return (const uint8_t  *)trn_cell_extension_pow_getarray_pow_solution((trn_cell_extension_pow_t*)inp);
+}
+const char *
+trn_cell_extension_pow_check(const trn_cell_extension_pow_t *obj)
+{
+  if (obj == NULL)
+    return "Object was NULL";
+  if (obj->trunnel_error_code_)
+    return "A set function failed on this object";
+  if (! (obj->pow_version == 1))
+    return "Integer out of bounds";
+  return NULL;
+}
+
+ssize_t
+trn_cell_extension_pow_encoded_len(const trn_cell_extension_pow_t *obj)
+{
+  ssize_t result = 0;
+
+  if (NULL != trn_cell_extension_pow_check(obj))
+     return -1;
+
+
+  /* Length of u8 pow_version IN [1] */
+  result += 1;
+
+  /* Length of u8 pow_nonce[TRUNNEL_POW_NONCE_LEN] */
+  result += TRUNNEL_POW_NONCE_LEN;
+
+  /* Length of u32 pow_effort */
+  result += 4;
+
+  /* Length of u8 pow_seed[TRUNNEL_POW_SEED_HEAD_LEN] */
+  result += TRUNNEL_POW_SEED_HEAD_LEN;
+
+  /* Length of u8 pow_solution[TRUNNEL_POW_SOLUTION_LEN] */
+  result += TRUNNEL_POW_SOLUTION_LEN;
+  return result;
+}
+int
+trn_cell_extension_pow_clear_errors(trn_cell_extension_pow_t *obj)
+{
+  int r = obj->trunnel_error_code_;
+  obj->trunnel_error_code_ = 0;
+  return r;
+}
+ssize_t
+trn_cell_extension_pow_encode(uint8_t *output, const size_t avail, const trn_cell_extension_pow_t *obj)
+{
+  ssize_t result = 0;
+  size_t written = 0;
+  uint8_t *ptr = output;
+  const char *msg;
+#ifdef TRUNNEL_CHECK_ENCODED_LEN
+  const ssize_t encoded_len = trn_cell_extension_pow_encoded_len(obj);
+#endif
+
+  if (NULL != (msg = trn_cell_extension_pow_check(obj)))
+    goto check_failed;
+
+#ifdef TRUNNEL_CHECK_ENCODED_LEN
+  trunnel_assert(encoded_len >= 0);
+#endif
+
+  /* Encode u8 pow_version IN [1] */
+  trunnel_assert(written <= avail);
+  if (avail - written < 1)
+    goto truncated;
+  trunnel_set_uint8(ptr, (obj->pow_version));
+  written += 1; ptr += 1;
+
+  /* Encode u8 pow_nonce[TRUNNEL_POW_NONCE_LEN] */
+  trunnel_assert(written <= avail);
+  if (avail - written < TRUNNEL_POW_NONCE_LEN)
+    goto truncated;
+  memcpy(ptr, obj->pow_nonce, TRUNNEL_POW_NONCE_LEN);
+  written += TRUNNEL_POW_NONCE_LEN; ptr += TRUNNEL_POW_NONCE_LEN;
+
+  /* Encode u32 pow_effort */
+  trunnel_assert(written <= avail);
+  if (avail - written < 4)
+    goto truncated;
+  trunnel_set_uint32(ptr, trunnel_htonl(obj->pow_effort));
+  written += 4; ptr += 4;
+
+  /* Encode u8 pow_seed[TRUNNEL_POW_SEED_HEAD_LEN] */
+  trunnel_assert(written <= avail);
+  if (avail - written < TRUNNEL_POW_SEED_HEAD_LEN)
+    goto truncated;
+  memcpy(ptr, obj->pow_seed, TRUNNEL_POW_SEED_HEAD_LEN);
+  written += TRUNNEL_POW_SEED_HEAD_LEN; ptr += TRUNNEL_POW_SEED_HEAD_LEN;
+
+  /* Encode u8 pow_solution[TRUNNEL_POW_SOLUTION_LEN] */
+  trunnel_assert(written <= avail);
+  if (avail - written < TRUNNEL_POW_SOLUTION_LEN)
+    goto truncated;
+  memcpy(ptr, obj->pow_solution, TRUNNEL_POW_SOLUTION_LEN);
+  written += TRUNNEL_POW_SOLUTION_LEN; ptr += TRUNNEL_POW_SOLUTION_LEN;
+
+
+  trunnel_assert(ptr == output + written);
+#ifdef TRUNNEL_CHECK_ENCODED_LEN
+  {
+    trunnel_assert(encoded_len >= 0);
+    trunnel_assert((size_t)encoded_len == written);
+  }
+
+#endif
+
+  return written;
+
+ truncated:
+  result = -2;
+  goto fail;
+ check_failed:
+  (void)msg;
+  result = -1;
+  goto fail;
+ fail:
+  trunnel_assert(result < 0);
+  return result;
+}
+
+/** As trn_cell_extension_pow_parse(), but do not allocate the output
+ * object.
+ */
+static ssize_t
+trn_cell_extension_pow_parse_into(trn_cell_extension_pow_t *obj, const uint8_t *input, const size_t len_in)
+{
+  const uint8_t *ptr = input;
+  size_t remaining = len_in;
+  ssize_t result = 0;
+  (void)result;
+
+  /* Parse u8 pow_version IN [1] */
+  CHECK_REMAINING(1, truncated);
+  obj->pow_version = (trunnel_get_uint8(ptr));
+  remaining -= 1; ptr += 1;
+  if (! (obj->pow_version == 1))
+    goto fail;
+
+  /* Parse u8 pow_nonce[TRUNNEL_POW_NONCE_LEN] */
+  CHECK_REMAINING(TRUNNEL_POW_NONCE_LEN, truncated);
+  memcpy(obj->pow_nonce, ptr, TRUNNEL_POW_NONCE_LEN);
+  remaining -= TRUNNEL_POW_NONCE_LEN; ptr += TRUNNEL_POW_NONCE_LEN;
+
+  /* Parse u32 pow_effort */
+  CHECK_REMAINING(4, truncated);
+  obj->pow_effort = trunnel_ntohl(trunnel_get_uint32(ptr));
+  remaining -= 4; ptr += 4;
+
+  /* Parse u8 pow_seed[TRUNNEL_POW_SEED_HEAD_LEN] */
+  CHECK_REMAINING(TRUNNEL_POW_SEED_HEAD_LEN, truncated);
+  memcpy(obj->pow_seed, ptr, TRUNNEL_POW_SEED_HEAD_LEN);
+  remaining -= TRUNNEL_POW_SEED_HEAD_LEN; ptr += TRUNNEL_POW_SEED_HEAD_LEN;
+
+  /* Parse u8 pow_solution[TRUNNEL_POW_SOLUTION_LEN] */
+  CHECK_REMAINING(TRUNNEL_POW_SOLUTION_LEN, truncated);
+  memcpy(obj->pow_solution, ptr, TRUNNEL_POW_SOLUTION_LEN);
+  remaining -= TRUNNEL_POW_SOLUTION_LEN; ptr += TRUNNEL_POW_SOLUTION_LEN;
+  trunnel_assert(ptr + remaining == input + len_in);
+  return len_in - remaining;
+
+ truncated:
+  return -2;
+ fail:
+  result = -1;
+  return result;
+}
+
+ssize_t
+trn_cell_extension_pow_parse(trn_cell_extension_pow_t **output, const uint8_t *input, const size_t len_in)
+{
+  ssize_t result;
+  *output = trn_cell_extension_pow_new();
+  if (NULL == *output)
+    return -1;
+  result = trn_cell_extension_pow_parse_into(*output, input, len_in);
+  if (result < 0) {
+    trn_cell_extension_pow_free(*output);
+    *output = NULL;
+  }
+  return result;
+}
 trn_cell_introduce1_t *
 trn_cell_introduce1_new(void)
 {
@@ -62,7 +406,7 @@ trn_cell_introduce1_clear(trn_cell_introduce1_t *obj)
   (void) obj;
   TRUNNEL_DYNARRAY_WIPE(&obj->auth_key);
   TRUNNEL_DYNARRAY_CLEAR(&obj->auth_key);
-  trn_cell_extension_free(obj->extensions);
+  trn_extension_free(obj->extensions);
   obj->extensions = NULL;
   TRUNNEL_DYNARRAY_WIPE(&obj->encrypted);
   TRUNNEL_DYNARRAY_CLEAR(&obj->encrypted);
@@ -207,25 +551,25 @@ trn_cell_introduce1_setlen_auth_key(trn_cell_introduce1_t *inp, size_t newlen)
   TRUNNEL_SET_ERROR_CODE(inp);
   return -1;
 }
-struct trn_cell_extension_st *
+struct trn_extension_st *
 trn_cell_introduce1_get_extensions(trn_cell_introduce1_t *inp)
 {
   return inp->extensions;
 }
-const struct trn_cell_extension_st *
+const struct trn_extension_st *
 trn_cell_introduce1_getconst_extensions(const trn_cell_introduce1_t *inp)
 {
   return trn_cell_introduce1_get_extensions((trn_cell_introduce1_t*) inp);
 }
 int
-trn_cell_introduce1_set_extensions(trn_cell_introduce1_t *inp, struct trn_cell_extension_st *val)
+trn_cell_introduce1_set_extensions(trn_cell_introduce1_t *inp, struct trn_extension_st *val)
 {
   if (inp->extensions && inp->extensions != val)
-    trn_cell_extension_free(inp->extensions);
+    trn_extension_free(inp->extensions);
   return trn_cell_introduce1_set0_extensions(inp, val);
 }
 int
-trn_cell_introduce1_set0_extensions(trn_cell_introduce1_t *inp, struct trn_cell_extension_st *val)
+trn_cell_introduce1_set0_extensions(trn_cell_introduce1_t *inp, struct trn_extension_st *val)
 {
   inp->extensions = val;
   return 0;
@@ -302,7 +646,7 @@ trn_cell_introduce1_check(const trn_cell_introduce1_t *obj)
     return "Length mismatch for auth_key";
   {
     const char *msg;
-    if (NULL != (msg = trn_cell_extension_check(obj->extensions)))
+    if (NULL != (msg = trn_extension_check(obj->extensions)))
       return msg;
   }
   return NULL;
@@ -329,8 +673,8 @@ trn_cell_introduce1_encoded_len(const trn_cell_introduce1_t *obj)
   /* Length of u8 auth_key[auth_key_len] */
   result += TRUNNEL_DYNARRAY_LEN(&obj->auth_key);
 
-  /* Length of struct trn_cell_extension extensions */
-  result += trn_cell_extension_encoded_len(obj->extensions);
+  /* Length of struct trn_extension extensions */
+  result += trn_extension_encoded_len(obj->extensions);
 
   /* Length of u8 encrypted[] */
   result += TRUNNEL_DYNARRAY_LEN(&obj->encrypted);
@@ -394,9 +738,9 @@ trn_cell_introduce1_encode(uint8_t *output, const size_t avail, const trn_cell_i
     written += elt_len; ptr += elt_len;
   }
 
-  /* Encode struct trn_cell_extension extensions */
+  /* Encode struct trn_extension extensions */
   trunnel_assert(written <= avail);
-  result = trn_cell_extension_encode(ptr, avail - written, obj->extensions);
+  result = trn_extension_encode(ptr, avail - written, obj->extensions);
   if (result < 0)
     goto fail; /* XXXXXXX !*/
   written += result; ptr += result;
@@ -472,8 +816,8 @@ trn_cell_introduce1_parse_into(trn_cell_introduce1_t *obj, const uint8_t *input,
     memcpy(obj->auth_key.elts_, ptr, obj->auth_key_len);
   ptr += obj->auth_key_len; remaining -= obj->auth_key_len;
 
-  /* Parse struct trn_cell_extension extensions */
-  result = trn_cell_extension_parse(&obj->extensions, ptr, remaining);
+  /* Parse struct trn_extension extensions */
+  result = trn_extension_parse(&obj->extensions, ptr, remaining);
   if (result < 0)
     goto relay_fail;
   trunnel_assert((size_t)result <= remaining);
@@ -529,7 +873,7 @@ static void
 trn_cell_introduce_ack_clear(trn_cell_introduce_ack_t *obj)
 {
   (void) obj;
-  trn_cell_extension_free(obj->extensions);
+  trn_extension_free(obj->extensions);
   obj->extensions = NULL;
 }
 
@@ -554,25 +898,25 @@ trn_cell_introduce_ack_set_status(trn_cell_introduce_ack_t *inp, uint16_t val)
   inp->status = val;
   return 0;
 }
-struct trn_cell_extension_st *
+struct trn_extension_st *
 trn_cell_introduce_ack_get_extensions(trn_cell_introduce_ack_t *inp)
 {
   return inp->extensions;
 }
-const struct trn_cell_extension_st *
+const struct trn_extension_st *
 trn_cell_introduce_ack_getconst_extensions(const trn_cell_introduce_ack_t *inp)
 {
   return trn_cell_introduce_ack_get_extensions((trn_cell_introduce_ack_t*) inp);
 }
 int
-trn_cell_introduce_ack_set_extensions(trn_cell_introduce_ack_t *inp, struct trn_cell_extension_st *val)
+trn_cell_introduce_ack_set_extensions(trn_cell_introduce_ack_t *inp, struct trn_extension_st *val)
 {
   if (inp->extensions && inp->extensions != val)
-    trn_cell_extension_free(inp->extensions);
+    trn_extension_free(inp->extensions);
   return trn_cell_introduce_ack_set0_extensions(inp, val);
 }
 int
-trn_cell_introduce_ack_set0_extensions(trn_cell_introduce_ack_t *inp, struct trn_cell_extension_st *val)
+trn_cell_introduce_ack_set0_extensions(trn_cell_introduce_ack_t *inp, struct trn_extension_st *val)
 {
   inp->extensions = val;
   return 0;
@@ -586,7 +930,7 @@ trn_cell_introduce_ack_check(const trn_cell_introduce_ack_t *obj)
     return "A set function failed on this object";
   {
     const char *msg;
-    if (NULL != (msg = trn_cell_extension_check(obj->extensions)))
+    if (NULL != (msg = trn_extension_check(obj->extensions)))
       return msg;
   }
   return NULL;
@@ -604,8 +948,8 @@ trn_cell_introduce_ack_encoded_len(const trn_cell_introduce_ack_t *obj)
   /* Length of u16 status */
   result += 2;
 
-  /* Length of struct trn_cell_extension extensions */
-  result += trn_cell_extension_encoded_len(obj->extensions);
+  /* Length of struct trn_extension extensions */
+  result += trn_extension_encoded_len(obj->extensions);
   return result;
 }
 int
@@ -640,9 +984,9 @@ trn_cell_introduce_ack_encode(uint8_t *output, const size_t avail, const trn_cel
   trunnel_set_uint16(ptr, trunnel_htons(obj->status));
   written += 2; ptr += 2;
 
-  /* Encode struct trn_cell_extension extensions */
+  /* Encode struct trn_extension extensions */
   trunnel_assert(written <= avail);
-  result = trn_cell_extension_encode(ptr, avail - written, obj->extensions);
+  result = trn_extension_encode(ptr, avail - written, obj->extensions);
   if (result < 0)
     goto fail; /* XXXXXXX !*/
   written += result; ptr += result;
@@ -687,8 +1031,8 @@ trn_cell_introduce_ack_parse_into(trn_cell_introduce_ack_t *obj, const uint8_t *
   obj->status = trunnel_ntohs(trunnel_get_uint16(ptr));
   remaining -= 2; ptr += 2;
 
-  /* Parse struct trn_cell_extension extensions */
-  result = trn_cell_extension_parse(&obj->extensions, ptr, remaining);
+  /* Parse struct trn_extension extensions */
+  result = trn_extension_parse(&obj->extensions, ptr, remaining);
   if (result < 0)
     goto relay_fail;
   trunnel_assert((size_t)result <= remaining);
@@ -733,7 +1077,7 @@ static void
 trn_cell_introduce_encrypted_clear(trn_cell_introduce_encrypted_t *obj)
 {
   (void) obj;
-  trn_cell_extension_free(obj->extensions);
+  trn_extension_free(obj->extensions);
   obj->extensions = NULL;
   TRUNNEL_DYNARRAY_WIPE(&obj->onion_key);
   TRUNNEL_DYNARRAY_CLEAR(&obj->onion_key);
@@ -796,25 +1140,25 @@ trn_cell_introduce_encrypted_getconstarray_rend_cookie(const trn_cell_introduce_
 {
   return (const uint8_t  *)trn_cell_introduce_encrypted_getarray_rend_cookie((trn_cell_introduce_encrypted_t*)inp);
 }
-struct trn_cell_extension_st *
+struct trn_extension_st *
 trn_cell_introduce_encrypted_get_extensions(trn_cell_introduce_encrypted_t *inp)
 {
   return inp->extensions;
 }
-const struct trn_cell_extension_st *
+const struct trn_extension_st *
 trn_cell_introduce_encrypted_getconst_extensions(const trn_cell_introduce_encrypted_t *inp)
 {
   return trn_cell_introduce_encrypted_get_extensions((trn_cell_introduce_encrypted_t*) inp);
 }
 int
-trn_cell_introduce_encrypted_set_extensions(trn_cell_introduce_encrypted_t *inp, struct trn_cell_extension_st *val)
+trn_cell_introduce_encrypted_set_extensions(trn_cell_introduce_encrypted_t *inp, struct trn_extension_st *val)
 {
   if (inp->extensions && inp->extensions != val)
-    trn_cell_extension_free(inp->extensions);
+    trn_extension_free(inp->extensions);
   return trn_cell_introduce_encrypted_set0_extensions(inp, val);
 }
 int
-trn_cell_introduce_encrypted_set0_extensions(trn_cell_introduce_encrypted_t *inp, struct trn_cell_extension_st *val)
+trn_cell_introduce_encrypted_set0_extensions(trn_cell_introduce_encrypted_t *inp, struct trn_extension_st *val)
 {
   inp->extensions = val;
   return 0;
@@ -1066,7 +1410,7 @@ trn_cell_introduce_encrypted_check(const trn_cell_introduce_encrypted_t *obj)
     return "A set function failed on this object";
   {
     const char *msg;
-    if (NULL != (msg = trn_cell_extension_check(obj->extensions)))
+    if (NULL != (msg = trn_extension_check(obj->extensions)))
       return msg;
   }
   if (! (obj->onion_key_type == TRUNNEL_HS_INTRO_ONION_KEY_TYPE_NTOR))
@@ -1099,8 +1443,8 @@ trn_cell_introduce_encrypted_encoded_len(const trn_cell_introduce_encrypted_t *o
   /* Length of u8 rend_cookie[TRUNNEL_REND_COOKIE_LEN] */
   result += TRUNNEL_REND_COOKIE_LEN;
 
-  /* Length of struct trn_cell_extension extensions */
-  result += trn_cell_extension_encoded_len(obj->extensions);
+  /* Length of struct trn_extension extensions */
+  result += trn_extension_encoded_len(obj->extensions);
 
   /* Length of u8 onion_key_type IN [TRUNNEL_HS_INTRO_ONION_KEY_TYPE_NTOR] */
   result += 1;
@@ -1159,9 +1503,9 @@ trn_cell_introduce_encrypted_encode(uint8_t *output, const size_t avail, const t
   memcpy(ptr, obj->rend_cookie, TRUNNEL_REND_COOKIE_LEN);
   written += TRUNNEL_REND_COOKIE_LEN; ptr += TRUNNEL_REND_COOKIE_LEN;
 
-  /* Encode struct trn_cell_extension extensions */
+  /* Encode struct trn_extension extensions */
   trunnel_assert(written <= avail);
-  result = trn_cell_extension_encode(ptr, avail - written, obj->extensions);
+  result = trn_extension_encode(ptr, avail - written, obj->extensions);
   if (result < 0)
     goto fail; /* XXXXXXX !*/
   written += result; ptr += result;
@@ -1263,8 +1607,8 @@ trn_cell_introduce_encrypted_parse_into(trn_cell_introduce_encrypted_t *obj, con
   memcpy(obj->rend_cookie, ptr, TRUNNEL_REND_COOKIE_LEN);
   remaining -= TRUNNEL_REND_COOKIE_LEN; ptr += TRUNNEL_REND_COOKIE_LEN;
 
-  /* Parse struct trn_cell_extension extensions */
-  result = trn_cell_extension_parse(&obj->extensions, ptr, remaining);
+  /* Parse struct trn_extension extensions */
+  result = trn_extension_parse(&obj->extensions, ptr, remaining);
   if (result < 0)
     goto relay_fail;
   trunnel_assert((size_t)result <= remaining);

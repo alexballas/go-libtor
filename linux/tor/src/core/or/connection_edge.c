@@ -69,6 +69,9 @@
 #include "core/or/circuituse.h"
 #include "core/or/circuitpadding.h"
 #include "core/or/connection_edge.h"
+#include "core/or/congestion_control_flow.h"
+#include "core/or/conflux_util.h"
+#include "core/or/circuitstats.h"
 #include "core/or/connection_or.h"
 #include "core/or/extendinfo.h"
 #include "core/or/policies.h"
@@ -100,6 +103,7 @@
 #include "feature/stats/predict_ports.h"
 #include "feature/stats/rephist.h"
 #include "lib/buf/buffers.h"
+#include "lib/crypt_ops/crypto_rand.h"
 #include "lib/crypt_ops/crypto_util.h"
 
 #include "core/or/cell_st.h"
@@ -482,6 +486,21 @@ clip_dns_ttl(uint32_t ttl)
     return MAX_DNS_TTL;
 }
 
+/** Given a TTL (in seconds), determine what TTL an exit relay should use by
+ * first clipping as usual and then adding some randomness which is sampled
+ * uniformly at random from [-FUZZY_DNS_TTL, FUZZY_DNS_TTL].  This facilitates
+ * fuzzy TTLs, which makes it harder to infer when a website was visited via
+ * side-channels like DNS (see "Website Fingerprinting with Website Oracles").
+ *
+ * Note that this can't underflow because FUZZY_DNS_TTL < MIN_DNS_TTL.
+ */
+uint32_t
+clip_dns_fuzzy_ttl(uint32_t ttl)
+{
+  return clip_dns_ttl(ttl) +
+    crypto_rand_uint(1 + 2*FUZZY_DNS_TTL) - FUZZY_DNS_TTL;
+}
+
 /** Send a relay end cell from stream <b>conn</b> down conn's circuit, and
  * remember that we've done so.  If this is not a client connection, set the
  * relay end cell's reason for closing as <b>reason</b>.
@@ -530,7 +549,7 @@ connection_edge_end(edge_connection_t *conn, uint8_t reason)
       memcpy(payload+1, tor_addr_to_in6_addr8(&conn->base_.addr), 16);
       addrlen = 16;
     }
-    set_uint32(payload+1+addrlen, htonl(clip_dns_ttl(conn->address_ttl)));
+    set_uint32(payload+1+addrlen, htonl(conn->address_ttl));
     payload_len += 4+addrlen;
   }
 
@@ -610,30 +629,69 @@ connection_half_edge_add(const edge_connection_t *conn,
 
   if (!circ->half_streams) {
     circ->half_streams = smartlist_new();
+    conflux_update_half_streams(circ, circ->half_streams);
   }
 
   half_conn->stream_id = conn->stream_id;
-
-  // How many sendme's should I expect?
-  half_conn->sendmes_pending =
-   (STREAMWINDOW_START-conn->package_window)/STREAMWINDOW_INCREMENT;
 
    // Is there a connected cell pending?
   half_conn->connected_pending = conn->base_.state ==
       AP_CONN_STATE_CONNECT_WAIT;
 
-  /* Data should only arrive if we're not waiting on a resolved cell.
-   * It can arrive after waiting on connected, because of optimistic
-   * data. */
-  if (conn->base_.state != AP_CONN_STATE_RESOLVE_WAIT) {
-    // How many more data cells can arrive on this id?
-    half_conn->data_pending = conn->deliver_window;
+  if (edge_uses_flow_control(conn)) {
+    /* If the edge uses the new congestion control flow control, we must use
+     * time-based limits on half-edge activity. */
+    uint64_t timeout_usec = (uint64_t)(get_circuit_build_timeout_ms()*1000);
+    half_conn->used_ccontrol = 1;
+
+    /* If this is an onion service circuit, double the CBT as an approximate
+     * value for the other half of the circuit */
+    if (conn->hs_ident) {
+      timeout_usec *= 2;
+    }
+
+    /* The stream should stop seeing any use after the larger of the circuit
+     * RTT and the overall circuit build timeout */
+    half_conn->end_ack_expected_usec = MAX(timeout_usec,
+                                           edge_get_max_rtt(conn)) +
+                                        monotime_absolute_usec();
+  } else {
+    // How many sendme's should I expect?
+    half_conn->sendmes_pending =
+     (STREAMWINDOW_START-conn->package_window)/STREAMWINDOW_INCREMENT;
+
+    /* Data should only arrive if we're not waiting on a resolved cell.
+     * It can arrive after waiting on connected, because of optimistic
+     * data. */
+    if (conn->base_.state != AP_CONN_STATE_RESOLVE_WAIT) {
+      // How many more data cells can arrive on this id?
+      half_conn->data_pending = conn->deliver_window;
+    }
   }
 
   insert_at = smartlist_bsearch_idx(circ->half_streams, &half_conn->stream_id,
                                     connection_half_edge_compare_bsearch,
                                     &ignored);
   smartlist_insert(circ->half_streams, insert_at, half_conn);
+}
+
+/**
+ * Return true if the circuit has any half-closed connections
+ * that are still within the end_ack_expected_usec timestamp
+ * from now.
+ */
+bool
+connection_half_edges_waiting(const origin_circuit_t *circ)
+{
+  if (!circ->half_streams)
+    return false;
+
+  SMARTLIST_FOREACH_BEGIN(circ->half_streams, const half_edge_t *, half_conn) {
+    if (half_conn->end_ack_expected_usec > monotime_absolute_usec())
+      return true;
+  } SMARTLIST_FOREACH_END(half_conn);
+
+  return false;
 }
 
 /** Release space held by <b>he</b> */
@@ -688,6 +746,12 @@ connection_half_edge_is_valid_data(const smartlist_t *half_conns,
   if (!half)
     return 0;
 
+  if (half->used_ccontrol) {
+    if (monotime_absolute_usec() > half->end_ack_expected_usec)
+      return 0;
+    return 1;
+  }
+
   if (half->data_pending > 0) {
     half->data_pending--;
     return 1;
@@ -738,6 +802,10 @@ connection_half_edge_is_valid_sendme(const smartlist_t *half_conns,
                                                           stream_id);
 
   if (!half)
+    return 0;
+
+  /* congestion control edges don't use sendmes */
+  if (half->used_ccontrol)
     return 0;
 
   if (half->sendmes_pending > 0) {
@@ -895,7 +963,7 @@ connected_cell_format_payload(uint8_t *payload_out,
     return -1;
   }
 
-  set_uint32(payload_out + connected_payload_len, htonl(clip_dns_ttl(ttl)));
+  set_uint32(payload_out + connected_payload_len, htonl(ttl));
   connected_payload_len += 4;
 
   tor_assert(connected_payload_len <= MAX_CONNECTED_CELL_PAYLOAD_LEN);
@@ -1145,7 +1213,10 @@ connection_ap_expire_beginning(void)
      * it here too because controllers that put streams in controller_wait
      * state never ask Tor to attach the circuit. */
     if (AP_CONN_STATE_IS_UNATTACHED(base_conn->state)) {
-      if (seconds_since_born >= options->SocksTimeout) {
+      /* If this is a connection to an HS with PoW defenses enabled, we need to
+       * wait longer than the usual Socks timeout. */
+      if (seconds_since_born >= options->SocksTimeout &&
+          !entry_conn->hs_with_pow_conn) {
         log_fn(severity, LD_APP,
             "Tried for %d seconds to get a connection to %s:%d. "
             "Giving up. (%s)",
@@ -1189,6 +1260,7 @@ connection_ap_expire_beginning(void)
     }
 
     if (circ->purpose != CIRCUIT_PURPOSE_C_GENERAL &&
+        circ->purpose != CIRCUIT_PURPOSE_CONFLUX_LINKED &&
         circ->purpose != CIRCUIT_PURPOSE_CONTROLLER &&
         circ->purpose != CIRCUIT_PURPOSE_C_HSDIR_GET &&
         circ->purpose != CIRCUIT_PURPOSE_S_HSDIR_POST &&
@@ -1269,15 +1341,6 @@ connection_ap_rescan_and_attach_pending(void)
   connection_ap_attach_pending(1);
 }
 
-#ifdef DEBUGGING_17659
-#define UNMARK() do {                           \
-    entry_conn->marked_pending_circ_line = 0;   \
-    entry_conn->marked_pending_circ_file = 0;   \
-  } while (0)
-#else /* !defined(DEBUGGING_17659) */
-#define UNMARK() do { } while (0)
-#endif /* defined(DEBUGGING_17659) */
-
 /** Tell any AP streams that are listed as waiting for a new circuit to try
  * again.  If there is an available circuit for a stream, attach it. Otherwise,
  * launch a new circuit.
@@ -1306,21 +1369,18 @@ connection_ap_attach_pending(int retry)
     connection_t *conn = ENTRY_TO_CONN(entry_conn);
     tor_assert(conn && entry_conn);
     if (conn->marked_for_close) {
-      UNMARK();
       continue;
     }
     if (conn->magic != ENTRY_CONNECTION_MAGIC) {
       log_warn(LD_BUG, "%p has impossible magic value %u.",
                entry_conn, (unsigned)conn->magic);
-      UNMARK();
       continue;
     }
     if (conn->state != AP_CONN_STATE_CIRCUIT_WAIT) {
-      log_warn(LD_BUG, "%p is no longer in circuit_wait. Its current state "
-               "is %s. Why is it on pending_entry_connections?",
-               entry_conn,
-               conn_state_to_string(conn->type, conn->state));
-      UNMARK();
+      /* The connection_ap_handshake_attach_circuit() call, for onion service,
+       * can lead to more than one connections in the "pending" list to change
+       * state and so it is OK to get here. Ignore it because this connection
+       * won't be in pending_entry_connections list after this point. */
       continue;
     }
 
@@ -1345,7 +1405,6 @@ connection_ap_attach_pending(int retry)
 
     /* If we got here, then we either closed the connection, or
      * we attached it. */
-    UNMARK();
   } SMARTLIST_FOREACH_END(entry_conn);
 
   smartlist_free(pending);
@@ -1416,7 +1475,6 @@ connection_ap_mark_as_non_pending_circuit(entry_connection_t *entry_conn)
 {
   if (PREDICT_UNLIKELY(NULL == pending_entry_connections))
     return;
-  UNMARK();
   smartlist_remove(pending_entry_connections, entry_conn);
 }
 
@@ -1612,23 +1670,6 @@ consider_plaintext_ports(entry_connection_t *conn, uint16_t port)
   return 0;
 }
 
-/** Return true iff <b>query</b> is a syntactically valid service ID (as
- * generated by rend_get_service_id).  */
-static int
-rend_valid_v2_service_id(const char *query)
-{
-  /** Length of 'y' portion of 'y.onion' URL. */
-#define REND_SERVICE_ID_LEN_BASE32 16
-
-  if (strlen(query) != REND_SERVICE_ID_LEN_BASE32)
-    return 0;
-
-  if (strspn(query, BASE32_CHARS) != REND_SERVICE_ID_LEN_BASE32)
-    return 0;
-
-  return 1;
-}
-
 /** Parse the given hostname in address. Returns true if the parsing was
  * successful and type_out contains the type of the hostname. Else, false is
  * returned which means it was not recognized and type_out is set to
@@ -1692,14 +1733,6 @@ parse_extended_hostname(char *address, hostname_type_t *type_out)
   if (q != address) {
     memmove(address, q, strlen(q) + 1 /* also get \0 */);
   }
-  /* v2 onion address check. */
-  if (strlen(query) == REND_SERVICE_ID_LEN_BASE32) {
-    *type_out = ONION_V2_HOSTNAME;
-    if (rend_valid_v2_service_id(query)) {
-      goto success;
-    }
-    goto failed;
-  }
 
   /* v3 onion address check. */
   if (strlen(query) == HS_SERVICE_ADDR_LEN_BASE32) {
@@ -1719,8 +1752,7 @@ parse_extended_hostname(char *address, hostname_type_t *type_out)
  failed:
   /* otherwise, return to previous state and return 0 */
   *s = '.';
-  const bool is_onion = (*type_out == ONION_V2_HOSTNAME) ||
-    (*type_out == ONION_V3_HOSTNAME);
+  const bool is_onion = (*type_out == ONION_V3_HOSTNAME);
   log_warn(LD_APP, "Invalid %shostname %s; rejecting",
            is_onion ? "onion " : "",
            safe_str_client(address));
@@ -2022,6 +2054,19 @@ connection_ap_handle_onion(entry_connection_t *conn,
     descriptor_is_usable =
       hs_client_any_intro_points_usable(&hs_conn_ident->identity_pk,
                                         cached_desc);
+    /* Check if PoW parameters have expired. If yes, the descriptor is
+     * unusable. */
+    if (cached_desc->encrypted_data.pow_params) {
+      if (cached_desc->encrypted_data.pow_params->expiration_time <
+          approx_time()) {
+        log_info(LD_REND, "Descriptor PoW parameters have expired.");
+        descriptor_is_usable = 0;
+      } else {
+        /* Mark that the connection is to an HS with PoW defenses on. */
+        conn->hs_with_pow_conn = 1;
+      }
+    }
+
     log_info(LD_GENERAL, "Found %s descriptor in cache for %s. %s.",
              (descriptor_is_usable) ? "usable" : "unusable",
              safe_str_client(socks->address),
@@ -2242,7 +2287,7 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
   }
 
   /* Now, we handle everything that isn't a .onion address. */
-  if (addresstype != ONION_V3_HOSTNAME && addresstype != ONION_V2_HOSTNAME) {
+  if (addresstype != ONION_V3_HOSTNAME) {
     /* Not a hidden-service request.  It's either a hostname or an IP,
      * possibly with a .exit that we stripped off.  We're going to check
      * if we're allowed to connect/resolve there, and then launch the
@@ -2527,28 +2572,6 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
     return 0;
   } else {
     /* If we get here, it's a request for a .onion address! */
-
-    /* We don't support v2 onions anymore. Log a warning and bail. */
-    if (addresstype == ONION_V2_HOSTNAME) {
-      static bool log_once = false;
-      if (!log_once) {
-        log_warn(LD_PROTOCOL, "Tried to connect to a v2 onion address, but "
-                 "this version of Tor no longer supports them. Please "
-                 "encourage the site operator to upgrade. For more "
-                 "information see "
-                 "https://blog.torproject.org/v2-deprecation-timeline.");
-        log_once = true;
-      }
-      control_event_client_status(LOG_WARN, "SOCKS_BAD_HOSTNAME HOSTNAME=%s",
-                                  escaped(socks->address));
-      /* Send back the 0xF6 extended code indicating a bad hostname. This is
-       * mostly so Tor Browser can make a proper UX with regards to v2
-       * addresses. */
-      conn->socks_request->socks_extended_error_code = SOCKS5_HS_BAD_ADDRESS;
-      connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
-      return -1;
-    }
-
     tor_assert(addresstype == ONION_V3_HOSTNAME);
     tor_assert(!automap);
     return connection_ap_handle_onion(conn, socks, circ);
@@ -3116,6 +3139,10 @@ get_unique_stream_id_by_circ(origin_circuit_t *circ)
                                            test_stream_id))
     goto again;
 
+  if (TO_CIRCUIT(circ)->conflux) {
+    conflux_sync_circ_fields(TO_CIRCUIT(circ)->conflux, circ);
+  }
+
   return test_stream_id;
 }
 
@@ -3127,6 +3154,8 @@ connection_ap_supports_optimistic_data(const entry_connection_t *conn)
   const edge_connection_t *edge_conn = ENTRY_TO_EDGE_CONN(conn);
   /* We can only send optimistic data if we're connected to an open
      general circuit. */
+  // TODO-329-PURPOSE: Can conflux circuits use optimistic data?
+  // Does anything use optimistic data?
   if (edge_conn->on_circuit == NULL ||
       edge_conn->on_circuit->state != CIRCUIT_STATE_OPEN ||
       (edge_conn->on_circuit->purpose != CIRCUIT_PURPOSE_C_GENERAL &&
@@ -3153,7 +3182,8 @@ connection_ap_get_begincell_flags(entry_connection_t *ap_conn)
     return 0;
 
   /* No flags for hidden services. */
-  if (edge_conn->on_circuit->purpose != CIRCUIT_PURPOSE_C_GENERAL)
+  if (edge_conn->on_circuit->purpose != CIRCUIT_PURPOSE_C_GENERAL &&
+      edge_conn->on_circuit->purpose != CIRCUIT_PURPOSE_CONFLUX_LINKED)
     return 0;
 
   /* If only IPv4 is supported, no flags */
@@ -3237,6 +3267,7 @@ connection_ap_handshake_send_begin,(entry_connection_t *ap_conn))
 
   tor_snprintf(payload,RELAY_PAYLOAD_SIZE, "%s:%d",
                (circ->base_.purpose == CIRCUIT_PURPOSE_C_GENERAL ||
+                circ->base_.purpose == CIRCUIT_PURPOSE_CONFLUX_LINKED ||
                 circ->base_.purpose == CIRCUIT_PURPOSE_CONTROLLER) ?
                  ap_conn->socks_request->address : "",
                ap_conn->socks_request->port);
@@ -3338,7 +3369,8 @@ connection_ap_handshake_send_resolve(entry_connection_t *ap_conn)
   tor_assert(base_conn->type == CONN_TYPE_AP);
   tor_assert(base_conn->state == AP_CONN_STATE_CIRCUIT_WAIT);
   tor_assert(ap_conn->socks_request);
-  tor_assert(circ->base_.purpose == CIRCUIT_PURPOSE_C_GENERAL);
+  tor_assert(circ->base_.purpose == CIRCUIT_PURPOSE_C_GENERAL ||
+             circ->base_.purpose == CIRCUIT_PURPOSE_CONFLUX_LINKED);
 
   command = ap_conn->socks_request->command;
   tor_assert(SOCKS_COMMAND_IS_RESOLVE(command));
@@ -4150,6 +4182,9 @@ connection_exit_begin_resolve(cell_t *cell, or_circuit_t *circ)
   if (rh.length > RELAY_PAYLOAD_SIZE)
     return -1;
 
+  /* Note the RESOLVE stream as seen. */
+  rep_hist_note_exit_stream(RELAY_COMMAND_RESOLVE);
+
   /* This 'dummy_conn' only exists to remember the stream ID
    * associated with the resolve request; and to make the
    * implementation of dns.c more uniform.  (We really only need to
@@ -4237,6 +4272,7 @@ connection_exit_connect(edge_connection_t *edge_conn)
     log_info(LD_EXIT,"%s failed exit policy%s. Closing.",
              connection_describe(conn),
              why_failed_exit_policy);
+    rep_hist_note_conn_rejected(conn->type, conn->socket_family);
     connection_edge_end(edge_conn, END_STREAM_REASON_EXITPOLICY);
     circuit_detach_stream(circuit_get_by_edge_conn(edge_conn), edge_conn);
     connection_free(conn);
@@ -4264,11 +4300,16 @@ connection_exit_connect(edge_connection_t *edge_conn)
       nodelist_reentry_contains(&conn->addr, conn->port)) {
     log_info(LD_EXIT, "%s tried to connect back to a known relay address. "
                       "Closing.", connection_describe(conn));
+    rep_hist_note_conn_rejected(conn->type, conn->socket_family);
     connection_edge_end(edge_conn, END_STREAM_REASON_CONNECTREFUSED);
     circuit_detach_stream(circuit_get_by_edge_conn(edge_conn), edge_conn);
     connection_free(conn);
     return;
   }
+
+  /* Note the BEGIN stream as seen. We do this after the Exit policy check in
+   * order to only account for valid streams. */
+  rep_hist_note_exit_stream(RELAY_COMMAND_BEGIN);
 
 #ifdef HAVE_SYS_UN_H
   if (conn->socket_family != AF_UNIX) {
@@ -4364,6 +4405,9 @@ connection_exit_connect_dir(edge_connection_t *exitconn)
   or_circuit_t *circ = TO_OR_CIRCUIT(exitconn->on_circuit);
 
   log_info(LD_EXIT, "Opening local connection for anonymized directory exit");
+
+  /* Note the BEGIN_DIR stream as seen. */
+  rep_hist_note_exit_stream(RELAY_COMMAND_BEGIN_DIR);
 
   exitconn->base_.state = EXIT_CONN_STATE_OPEN;
 

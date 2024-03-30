@@ -11,7 +11,7 @@
  * constructing/sending create/extend cells, and so on).
  *
  * On the client side, this module handles launching circuits. Circuit
- * launches are srtarted from circuit_establish_circuit(), called from
+ * launches are started from circuit_establish_circuit(), called from
  * circuit_launch_by_extend_info()).  To choose the path the circuit will
  * take, onion_extend_cpath() calls into a maze of node selection functions.
  *
@@ -45,6 +45,7 @@
 #include "core/or/command.h"
 #include "core/or/connection_edge.h"
 #include "core/or/connection_or.h"
+#include "core/or/conflux_pool.h"
 #include "core/or/extendinfo.h"
 #include "core/or/onion.h"
 #include "core/or/ocirc_event.h"
@@ -72,6 +73,7 @@
 #include "feature/stats/predict_ports.h"
 #include "lib/crypt_ops/crypto_rand.h"
 #include "lib/trace/events.h"
+#include "core/or/congestion_control_common.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/cpath_build_state_st.h"
@@ -81,11 +83,15 @@
 #include "core/or/or_circuit_st.h"
 #include "core/or/origin_circuit_st.h"
 
+#include "trunnel/extension.h"
+#include "trunnel/congestion_control.h"
+
 static int circuit_send_first_onion_skin(origin_circuit_t *circ);
 static int circuit_build_no_more_hops(origin_circuit_t *circ);
 static int circuit_send_intermediate_onion_skin(origin_circuit_t *circ,
                                                 crypt_path_t *hop);
-static const node_t *choose_good_middle_server(uint8_t purpose,
+static const node_t *choose_good_middle_server(const origin_circuit_t *,
+                          uint8_t purpose,
                           cpath_build_state_t *state,
                           crypt_path_t *head,
                           int cur_len);
@@ -461,6 +467,8 @@ origin_circuit_init(uint8_t purpose, int flags)
     ((flags & CIRCLAUNCH_IS_INTERNAL) ? 1 : 0);
   circ->build_state->is_ipv6_selftest =
     ((flags & CIRCLAUNCH_IS_IPV6_SELFTEST) ? 1 : 0);
+  circ->build_state->need_conflux =
+    ((flags & CIRCLAUNCH_NEED_CONFLUX) ? 1 : 0);
   circ->base_.purpose = purpose;
   return circ;
 }
@@ -487,6 +495,47 @@ circuit_establish_circuit(uint8_t purpose, extend_info_t *exit_ei, int flags)
   circ = origin_circuit_init(purpose, flags);
 
   if (onion_pick_cpath_exit(circ, exit_ei, is_hs_v3_rp_circuit) < 0 ||
+      onion_populate_cpath(circ) < 0) {
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_NOPATH);
+    return NULL;
+  }
+
+  circuit_event_status(circ, CIRC_EVENT_LAUNCHED, 0);
+
+  if ((err_reason = circuit_handle_first_hop(circ)) < 0) {
+    circuit_mark_for_close(TO_CIRCUIT(circ), -err_reason);
+    return NULL;
+  }
+
+  tor_trace(TR_SUBSYS(circuit), TR_EV(establish), circ);
+  return circ;
+}
+
+/**
+ * Build a new conflux circuit for <b>purpose</b>. If <b>exit</b> is defined,
+ * then use that as your exit router, else choose a suitable exit node.
+ * The <b>flags</b> argument is a bitfield of CIRCLAUNCH_* flags, see
+ * circuit_launch_by_extend_info() for more details.
+ *
+ * Also launch a connection to the first OR in the chosen path, if
+ * it's not open already.
+ */
+MOCK_IMPL(origin_circuit_t *,
+circuit_establish_circuit_conflux,(const uint8_t *conflux_nonce,
+                                   uint8_t purpose, extend_info_t *exit_ei,
+                                   int flags))
+{
+  origin_circuit_t *circ;
+  int err_reason = 0;
+
+  /* Right now, only conflux client circuits use this function */
+  tor_assert(purpose == CIRCUIT_PURPOSE_CONFLUX_UNLINKED);
+
+  circ = origin_circuit_init(purpose, flags);
+  TO_CIRCUIT(circ)->conflux_pending_nonce =
+    tor_memdup(conflux_nonce, DIGEST256_LEN);
+
+  if (onion_pick_cpath_exit(circ, exit_ei, 0) < 0 ||
       onion_populate_cpath(circ) < 0) {
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_NOPATH);
     return NULL;
@@ -841,7 +890,13 @@ circuit_pick_create_handshake(uint8_t *cell_type_out,
    * using the TAP handshake, and CREATE2 otherwise. */
   if (extend_info_supports_ntor(ei)) {
     *cell_type_out = CELL_CREATE2;
-    *handshake_type_out = ONION_HANDSHAKE_TYPE_NTOR;
+    /* Only use ntor v3 with exits that support congestion control,
+     * and only when it is enabled. */
+    if (ei->exit_supports_congestion_control &&
+        congestion_control_enabled())
+      *handshake_type_out = ONION_HANDSHAKE_TYPE_NTOR_V3;
+    else
+      *handshake_type_out = ONION_HANDSHAKE_TYPE_NTOR;
   } else {
     /* XXXX030 Remove support for deciding to use TAP and EXTEND. */
     *cell_type_out = CELL_CREATE;
@@ -995,7 +1050,8 @@ circuit_send_first_onion_skin(origin_circuit_t *circ)
   len = onion_skin_create(cc.handshake_type,
                           circ->cpath->extend_info,
                           &circ->cpath->handshake_state,
-                          cc.onionskin);
+                          cc.onionskin,
+                          sizeof(cc.onionskin));
   if (len < 0) {
     log_warn(LD_CIRC,"onion_skin_create (first hop) failed.");
     return - END_CIRC_REASON_INTERNAL;
@@ -1142,7 +1198,8 @@ circuit_send_intermediate_onion_skin(origin_circuit_t *circ,
   len = onion_skin_create(ec.create_cell.handshake_type,
                           hop->extend_info,
                           &hop->handshake_state,
-                          ec.create_cell.onionskin);
+                          ec.create_cell.onionskin,
+                          sizeof(ec.create_cell.onionskin));
   if (len < 0) {
     log_warn(LD_CIRC,"onion_skin_create failed.");
     return - END_CIRC_REASON_INTERNAL;
@@ -1240,6 +1297,7 @@ circuit_finish_handshake(origin_circuit_t *circ,
   }
   tor_assert(hop->state == CPATH_STATE_AWAITING_KEYS);
 
+  circuit_params_t params;
   {
     const char *msg = NULL;
     if (onion_skin_client_handshake(hop->handshake_state.tag,
@@ -1247,6 +1305,7 @@ circuit_finish_handshake(origin_circuit_t *circ,
                                     reply->reply, reply->handshake_len,
                                     (uint8_t*)keys, sizeof(keys),
                                     (uint8_t*)hop->rend_circ_nonce,
+                                    &params,
                                     &msg) < 0) {
       if (msg)
         log_warn(LD_CIRC,"onion_skin_client_handshake failed: %s", msg);
@@ -1258,6 +1317,40 @@ circuit_finish_handshake(origin_circuit_t *circ,
 
   if (cpath_init_circuit_crypto(hop, keys, sizeof(keys), 0, 0)<0) {
     return -END_CIRC_REASON_TORPROTOCOL;
+  }
+
+  if (params.cc_enabled) {
+    int circ_len = circuit_get_cpath_len(circ);
+
+    if (circ_len == DEFAULT_ROUTE_LEN &&
+        circuit_get_cpath_hop(circ, DEFAULT_ROUTE_LEN) == hop) {
+      hop->ccontrol = congestion_control_new(&params, CC_PATH_EXIT);
+    } else if (circ_len == SBWS_ROUTE_LEN &&
+               circuit_get_cpath_hop(circ, SBWS_ROUTE_LEN) == hop) {
+      hop->ccontrol = congestion_control_new(&params, CC_PATH_SBWS);
+    } else {
+      if (circ_len > DEFAULT_ROUTE_LEN) {
+        /* This can happen for unknown reasons; cannibalization codepaths
+         * don't seem able to do it, so there is some magic way that hops can
+         * still get added. Perhaps some cases of circuit pre-build that change
+         * purpose? */
+        log_info(LD_CIRC,
+                   "Unexpected path length %d for exit circuit %d, purpose %d",
+                    circ_len, circ->global_identifier,
+                    TO_CIRCUIT(circ)->purpose);
+        hop->ccontrol = congestion_control_new(&params, CC_PATH_EXIT);
+      } else {
+        /* This is likely directory requests, which should block on orconn
+         * before congestion control, but lets give them the lower sbws
+         * param set anyway just in case. */
+        log_info(LD_CIRC,
+                 "Unexpected path length %d for exit circuit %d, purpose %d",
+                 circ_len, circ->global_identifier,
+                 TO_CIRCUIT(circ)->purpose);
+
+        hop->ccontrol = congestion_control_new(&params, CC_PATH_SBWS);
+      }
+    }
   }
 
   hop->state = CPATH_STATE_OPEN;
@@ -1359,7 +1452,9 @@ route_len_for_purpose(uint8_t purpose, extend_info_t *exit_ei)
   int routelen = DEFAULT_ROUTE_LEN;
   int known_purpose = 0;
 
-  if (circuit_should_use_vanguards(purpose)) {
+  /* If we're using L3 vanguards, we need longer paths for onion services */
+  if (circuit_purpose_is_hidden_service(purpose) &&
+      get_options()->HSLayer3Nodes) {
     /* Clients want an extra hop for rends to avoid linkability.
      * Services want it for intro points to avoid publishing their
      * layer3 guards. They want it for hsdir posts to use
@@ -1372,14 +1467,6 @@ route_len_for_purpose(uint8_t purpose, extend_info_t *exit_ei)
         purpose == CIRCUIT_PURPOSE_S_HSDIR_POST ||
         purpose == CIRCUIT_PURPOSE_HS_VANGUARDS ||
         purpose == CIRCUIT_PURPOSE_S_ESTABLISH_INTRO)
-      return routelen+1;
-
-    /* If we only have Layer2 vanguards, then we do not need
-     * the extra hop for linkabilty reasons (see below).
-     * This means all hops can be of the form:
-     *   S/C - G - L2 - M - R/HSDir/I
-     */
-    if (get_options()->HSLayer2Nodes && !get_options()->HSLayer3Nodes)
       return routelen+1;
 
     /* For connections to hsdirs, clients want two extra hops
@@ -1400,16 +1487,15 @@ route_len_for_purpose(uint8_t purpose, extend_info_t *exit_ei)
     return routelen;
 
   switch (purpose) {
-    /* These two purposes connect to a router that we chose, so
-     * DEFAULT_ROUTE_LEN is safe. */
-  case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
-    /* hidden service connecting to introduction point */
+    /* These purposes connect to a router that we chose, so DEFAULT_ROUTE_LEN
+     * is safe: */
+  case CIRCUIT_PURPOSE_CONFLUX_UNLINKED:
   case CIRCUIT_PURPOSE_TESTING:
     /* router reachability testing */
     known_purpose = 1;
     break;
 
-    /* These three purposes connect to a router that someone else
+    /* These purposes connect to a router that someone else
      * might have chosen, so add an extra hop to protect anonymity. */
   case CIRCUIT_PURPOSE_C_GENERAL:
   case CIRCUIT_PURPOSE_C_HSDIR_GET:
@@ -1419,6 +1505,9 @@ route_len_for_purpose(uint8_t purpose, extend_info_t *exit_ei)
     /* client connecting to introduction point */
   case CIRCUIT_PURPOSE_S_CONNECT_REND:
     /* hidden service connecting to rendezvous point */
+  case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
+    /* hidden service connecting to intro point. In this case we want an extra
+       hop to avoid linkability attacks by the introduction point. */
     known_purpose = 1;
     routelen++;
     break;
@@ -1884,6 +1973,7 @@ choose_good_exit_server(origin_circuit_t *circ,
        * since it should be random. */
       tor_assert_nonfatal(is_internal);
       FALLTHROUGH;
+    case CIRCUIT_PURPOSE_CONFLUX_UNLINKED:
     case CIRCUIT_PURPOSE_C_GENERAL:
       if (is_internal) /* pick it like a middle hop */
         return router_choose_random_node(NULL, options->ExcludeNodes, flags);
@@ -1931,6 +2021,8 @@ warn_if_last_router_excluded(origin_circuit_t *circ,
     case CIRCUIT_PURPOSE_S_HSDIR_POST:
     case CIRCUIT_PURPOSE_C_HSDIR_GET:
     case CIRCUIT_PURPOSE_C_GENERAL:
+    case CIRCUIT_PURPOSE_CONFLUX_UNLINKED:
+    case CIRCUIT_PURPOSE_CONFLUX_LINKED:
       if (circ->build_state->is_internal)
         return;
       description = "requested exit node";
@@ -2019,7 +2111,7 @@ cpath_build_state_to_crn_ipv6_extend_flag(const cpath_build_state_t *state,
 }
 
 /** Decide a suitable length for circ's cpath, and pick an exit
- * router (or use <b>exit</b> if provided). Store these in the
+ * router (or use <b>exit_ei</b> if provided). Store these in the
  * cpath.
  *
  * If <b>is_hs_v3_rp_circuit</b> is set, then this exit should be suitable to
@@ -2058,13 +2150,21 @@ onion_pick_cpath_exit(origin_circuit_t *circ, extend_info_t *exit_ei,
       flags |= CRN_DIRECT_CONN;
     if (is_hs_v3_rp_circuit)
       flags |= CRN_RENDEZVOUS_V3;
+    if (state->need_conflux)
+      flags |= CRN_CONFLUX;
     const node_t *node =
       choose_good_exit_server(circ, flags, state->is_internal);
     if (!node) {
       log_warn(LD_CIRC,"Failed to choose an exit server");
       return -1;
     }
-    exit_ei = extend_info_from_node(node, state->onehop_tunnel);
+    exit_ei = extend_info_from_node(node, state->onehop_tunnel,
+                /* for_exit_use */
+                !state->is_internal && (
+                  TO_CIRCUIT(circ)->purpose ==
+                  CIRCUIT_PURPOSE_C_GENERAL ||
+                  TO_CIRCUIT(circ)->purpose ==
+                  CIRCUIT_PURPOSE_CONFLUX_UNLINKED));
     if (BUG(exit_ei == NULL))
       return -1;
   }
@@ -2072,7 +2172,7 @@ onion_pick_cpath_exit(origin_circuit_t *circ, extend_info_t *exit_ei,
   return 0;
 }
 
-/** Give <b>circ</b> a new exit destination to <b>exit</b>, and add a
+/** Give <b>circ</b> a new exit destination to <b>exit_ei</b>, and add a
  * hop to the cpath reflecting this. Don't send the next extend cell --
  * the caller will do this if it wants to.
  */
@@ -2113,8 +2213,6 @@ circuit_extend_to_new_exit(origin_circuit_t *circ, extend_info_t *exit_ei)
     circuit_mark_for_close(TO_CIRCUIT(circ), -err_reason);
     return -1;
   }
-
-  // XXX: Should cannibalized circuits be dirty or not? Not easy to say..
 
   return 0;
 }
@@ -2217,7 +2315,8 @@ build_vanguard_middle_exclude_list(uint8_t purpose,
  * hop, based on already chosen nodes.
  */
 static smartlist_t *
-build_middle_exclude_list(uint8_t purpose,
+build_middle_exclude_list(const origin_circuit_t *circ,
+                          uint8_t purpose,
                           cpath_build_state_t *state,
                           crypt_path_t *head,
                           int cur_len)
@@ -2233,6 +2332,9 @@ build_middle_exclude_list(uint8_t purpose,
   }
 
   excluded = smartlist_new();
+
+  // Exclude other middles on pending and built conflux circs
+  conflux_add_middles_to_exclude_list(circ, excluded);
 
   /* For non-vanguard circuits, add the exit and its family to the exclude list
    * (note that the exit/last hop is always chosen first in
@@ -2261,8 +2363,14 @@ middle_node_must_be_vanguard(const or_options_t *options,
     return 0;
   }
 
-  /* If we have sticky L2 nodes, and this is an L2 pick, use vanguards */
-  if (options->HSLayer2Nodes && cur_len == 1) {
+  /* Don't even bother if the feature is disabled */
+  if (!vanguards_lite_is_enabled()) {
+    return 0;
+  }
+
+  /* If we are a hidden service circuit, always use either vanguards-lite
+   * or HSLayer2Nodes for 2nd hop. */
+  if (cur_len == 1) {
     return 1;
   }
 
@@ -2286,12 +2394,17 @@ pick_vanguard_middle_node(const or_options_t *options,
 
   /* Pick the right routerset based on the current hop */
   if (cur_len == 1) {
-    vanguard_routerset = options->HSLayer2Nodes;
+    vanguard_routerset = options->HSLayer2Nodes ?
+      options->HSLayer2Nodes : get_layer2_guards();
   } else if (cur_len == 2) {
     vanguard_routerset = options->HSLayer3Nodes;
   } else {
     /* guaranteed by middle_node_should_be_vanguard() */
     tor_assert_nonfatal_unreached();
+    return NULL;
+  }
+
+  if (BUG(!vanguard_routerset)) {
     return NULL;
   }
 
@@ -2316,7 +2429,8 @@ pick_vanguard_middle_node(const or_options_t *options,
  * family, and make sure we don't duplicate any previous nodes or their
  * families. */
 static const node_t *
-choose_good_middle_server(uint8_t purpose,
+choose_good_middle_server(const origin_circuit_t * circ,
+                          uint8_t purpose,
                           cpath_build_state_t *state,
                           crypt_path_t *head,
                           int cur_len)
@@ -2331,7 +2445,7 @@ choose_good_middle_server(uint8_t purpose,
   log_debug(LD_CIRC, "Contemplating intermediate hop #%d: random choice.",
             cur_len+1);
 
-  excluded = build_middle_exclude_list(purpose, state, head, cur_len);
+  excluded = build_middle_exclude_list(circ, purpose, state, head, cur_len);
 
   flags |= cpath_build_state_to_crn_flags(state);
   flags |= cpath_build_state_to_crn_ipv6_extend_flag(state, cur_len);
@@ -2376,7 +2490,8 @@ choose_good_middle_server(uint8_t purpose,
  * guard worked or not.
  */
 const node_t *
-choose_good_entry_server(uint8_t purpose, cpath_build_state_t *state,
+choose_good_entry_server(const origin_circuit_t *circ,
+                         uint8_t purpose, cpath_build_state_t *state,
                          circuit_guard_state_t **guard_state_out)
 {
   const node_t *choice;
@@ -2398,7 +2513,7 @@ choose_good_entry_server(uint8_t purpose, cpath_build_state_t *state,
     /* This request is for an entry server to use for a regular circuit,
      * and we use entry guard nodes.  Just return one of the guard nodes.  */
     tor_assert(guard_state_out);
-    return guards_choose_guard(state, purpose, guard_state_out);
+    return guards_choose_guard(circ, state, purpose, guard_state_out);
   }
 
   excluded = smartlist_new();
@@ -2444,28 +2559,39 @@ onion_extend_cpath(origin_circuit_t *circ)
   if (cur_len == state->desired_path_len - 1) { /* Picking last node */
     info = extend_info_dup(state->chosen_exit);
   } else if (cur_len == 0) { /* picking first node */
-    const node_t *r = choose_good_entry_server(purpose, state,
+    const node_t *r = choose_good_entry_server(circ, purpose, state,
                                                &circ->guard_state);
     if (r) {
       /* If we're a client, use the preferred address rather than the
          primary address, for potentially connecting to an IPv6 OR
          port. Servers always want the primary (IPv4) address. */
       int client = (server_mode(get_options()) == 0);
-      info = extend_info_from_node(r, client);
+      info = extend_info_from_node(r, client, false);
       /* Clients can fail to find an allowed address */
       tor_assert_nonfatal(info || client);
     }
   } else {
     const node_t *r =
-      choose_good_middle_server(purpose, state, circ->cpath, cur_len);
+      choose_good_middle_server(circ, purpose, state, circ->cpath, cur_len);
     if (r) {
-      info = extend_info_from_node(r, 0);
+      info = extend_info_from_node(r, 0, false);
     }
   }
 
   if (!info) {
-    log_warn(LD_CIRC,"Failed to find node for hop #%d of our path. Discarding "
-             "this circuit.", cur_len+1);
+    /* This can happen on first startup, possibly due to insufficient relays
+     * downloaded to pick vanguards-lite layer2 nodes, or other ephemeral
+     * reasons. It only happens briefly, is hard to reproduce, and then goes
+     * away for ever. :/ */
+    if (!router_have_minimum_dir_info()) {
+       log_info(LD_CIRC,
+                "Failed to find node for hop #%d of our path. Discarding "
+                "this circuit.", cur_len+1);
+    } else {
+       log_notice(LD_CIRC,
+                 "Failed to find node for hop #%d of our path. Discarding "
+                 "this circuit.", cur_len+1);
+    }
     return -1;
   }
 
@@ -2568,4 +2694,26 @@ circuit_upgrade_circuits_from_guard_wait(void)
   } SMARTLIST_FOREACH_END(circ);
 
   smartlist_free(to_upgrade);
+}
+
+/**
+ * Try to generate a circuit-negotiation message for communication with a
+ * given relay.  Assumes we are using ntor v3, or some later version that
+ * supports parameter negotiatoin.
+ *
+ * On success, return 0 and pass back a message in the `out` parameters.
+ * Otherwise, return -1.
+ **/
+int
+client_circ_negotiation_message(const extend_info_t *ei,
+                                uint8_t **msg_out,
+                                size_t *msg_len_out)
+{
+  tor_assert(ei && msg_out && msg_len_out);
+
+  if (!ei->exit_supports_congestion_control) {
+    return -1;
+  }
+
+  return congestion_control_build_ext_request(msg_out, msg_len_out);
 }
