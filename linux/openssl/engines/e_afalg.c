@@ -12,7 +12,9 @@
 
 /* Required for vmsplice */
 #ifndef _GNU_SOURCE
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #endif
 #include <stdio.h>
 #include <string.h>

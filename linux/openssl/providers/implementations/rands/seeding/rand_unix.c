@@ -8,7 +8,9 @@
  */
 
 #ifndef _GNU_SOURCE
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #endif
 #include "internal/e_os.h"
 #include <stdio.h>

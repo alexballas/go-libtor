@@ -25,7 +25,9 @@
 #endif
 
 #ifdef REPORT_RWLOCK_CONTENTION
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <execinfo.h>
 #include <unistd.h>
 #endif

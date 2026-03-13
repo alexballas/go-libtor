@@ -35,6 +35,7 @@
 
 /* This code is extracted from csiphash.h */
 
+#ifndef _le64toh
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) &&      \
 	__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #  define _le64toh(x) ((uint64_t)(x))
@@ -68,4 +69,5 @@
 #    endif
 #  endif
 
+#endif
 #endif

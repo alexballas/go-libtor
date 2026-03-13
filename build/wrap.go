@@ -1448,6 +1448,7 @@ package libtor
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/feature/api
 
 #cgo CFLAGS: -D_GNU_SOURCE
+#cgo CFLAGS: -Wno-deprecated-declarations
 #cgo CFLAGS: -DED25519_CUSTOMRANDOM -DED25519_CUSTOMHASH -DED25519_SUFFIX=_donna
 #cgo CFLAGS: -include ${SRCDIR}/../tor_config/gotor_extra.h
 
