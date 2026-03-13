@@ -1668,7 +1668,7 @@ evbuffer_search_eol(struct evbuffer *buffer,
 		if (evbuffer_strchr(&it, '\n') < 0)
 			goto done;
 		extra_drain = 1;
-		/* ... optionally preceeded by a CR. */
+		/* ... optionally preceded by a CR. */
 		if (it.pos == start_pos)
 			break; /* If the first character is \n, don't back up */
 		/* This potentially does an extra linear walk over the first
@@ -3080,7 +3080,11 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 			offset_leftover = offset % page_size;
 			offset_rounded = offset - offset_leftover;
 		}
+#if defined(EVENT__HAVE_MMAP64)
+		mapped = mmap64(NULL, length + offset_leftover,
+#else
 		mapped = mmap(NULL, length + offset_leftover,
+#endif
 		    PROT_READ,
 #ifdef MAP_NOCACHE
 		    MAP_NOCACHE | /* ??? */
@@ -3121,13 +3125,29 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 	}
 #endif
 	{
-		ev_off_t start_pos = lseek(fd, 0, SEEK_CUR), pos;
 		ev_off_t read_so_far = 0;
-		char *mem;
-		int e;
 		ev_ssize_t n = 0;
+		char *mem;
+#ifndef EVENT__HAVE_PREAD
+		ev_off_t start_pos = lseek(fd, 0, SEEK_CUR);
+		ev_off_t pos;
+		int e;
+#endif /* no pread() */
 		if (!(mem = mm_malloc(length)))
 			goto err;
+#ifdef EVENT__HAVE_PREAD
+		while (read_so_far < length) {
+			n = pread(fd, mem + read_so_far, length - read_so_far,
+				  offset + read_so_far);
+			if (n <= 0)
+				break;
+			read_so_far += n;
+		}
+		if (n < 0 || (n == 0 && length > read_so_far)) {
+			mm_free(mem);
+			goto err;
+		}
+#else /* fallback to seek() and read() */
 		if (start_pos < 0) {
 			mm_free(mem);
 			goto err;
@@ -3153,6 +3173,7 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 			mm_free(mem);
 			goto err;
 		}
+#endif /* pread */
 
 		seg->contents = mem;
 	}

@@ -65,6 +65,7 @@
 #include "core/or/conflux.h"
 #include "core/or/conflux_pool.h"
 #include "core/or/crypt_path.h"
+#include "core/or/dos.h"
 #include "core/or/extendinfo.h"
 #include "core/or/status.h"
 #include "core/or/trace_probes_circuit.h"
@@ -158,6 +159,10 @@ double cc_stats_circ_close_cwnd_ma = 0;
 double cc_stats_circ_close_ss_cwnd_ma = 0;
 
 uint64_t cc_stats_circs_closed = 0;
+
+/** Total number of circuit protocol violation. This is incremented when the
+ * END_CIRC_REASON_TORPROTOCOL is used to close a circuit. */
+uint64_t circ_n_proto_violation = 0;
 
 /********* END VARIABLES ************/
 
@@ -1130,6 +1135,7 @@ or_circuit_new(circid_t p_circ_id, channel_t *p_chan)
   cell_queue_init(&circ->p_chan_cells);
 
   init_circuit_base(TO_CIRCUIT(circ));
+  dos_stream_init_circ_tbf(circ);
 
   tor_trace(TR_SUBSYS(circuit), TR_EV(new_or), circ);
   return circ;
@@ -1822,30 +1828,6 @@ circuit_get_next_by_purpose(origin_circuit_t *start, uint8_t purpose)
   return NULL;
 }
 
-/** We might cannibalize this circuit: Return true if its last hop can be used
- *  as a v3 rendezvous point. */
-static int
-circuit_can_be_cannibalized_for_v3_rp(const origin_circuit_t *circ)
-{
-  if (!circ->build_state) {
-    return 0;
-  }
-
-  extend_info_t *chosen_exit = circ->build_state->chosen_exit;
-  if (BUG(!chosen_exit)) {
-    return 0;
-  }
-
-  const node_t *rp_node = node_get_by_id(chosen_exit->identity_digest);
-  if (rp_node) {
-    if (node_supports_v3_rendezvous_point(rp_node)) {
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
 /** We are trying to create a circuit of purpose <b>purpose</b> and we are
  *  looking for cannibalizable circuits. Return the circuit purpose we would be
  *  willing to cannibalize. */
@@ -1973,13 +1955,6 @@ circuit_find_to_cannibalize(uint8_t purpose_to_produce, extend_info_t *info,
               goto next;
             hop = hop->next;
           } while (hop != circ->cpath);
-        }
-
-        if ((flags & CIRCLAUNCH_IS_V3_RP) &&
-            !circuit_can_be_cannibalized_for_v3_rp(circ)) {
-          log_debug(LD_GENERAL, "Skipping uncannibalizable circuit for v3 "
-                    "rendezvous point.");
-          goto next;
         }
 
         if (!best || (best->build_state->need_uptime && !need_uptime))
@@ -2194,6 +2169,10 @@ circuit_mark_for_close_, (circuit_t *circ, int reason, int line,
   assert_circuit_ok(circ);
   tor_assert(line);
   tor_assert(file);
+
+  if (reason == END_CIRC_REASON_TORPROTOCOL) {
+    circ_n_proto_violation++;
+  }
 
   /* Check whether the circuitpadding subsystem wants to block this close */
   if (circpad_marked_circuit_for_padding(circ, reason)) {
@@ -2743,8 +2722,12 @@ circuits_handle_oom(size_t current_allocation)
        * outbuf due to a malicious destination holding off the read on us. */
       if ((conn->type == CONN_TYPE_DIR && conn->linked_conn == NULL) ||
           CONN_IS_EDGE(conn)) {
-        if (!conn->marked_for_close)
+        if (!conn->marked_for_close) {
+          if (CONN_IS_EDGE(conn)) {
+            TO_EDGE_CONN(conn)->end_reason = END_STREAM_REASON_RESOURCELIMIT;
+          }
           connection_mark_for_close(conn);
+        }
         mem_recovered += single_conn_free_bytes(conn);
 
         if (conn->type == CONN_TYPE_DIR) {

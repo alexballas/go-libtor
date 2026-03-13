@@ -196,7 +196,8 @@ conflux_free_(conflux_t *cfx)
   } SMARTLIST_FOREACH_END(leg);
   smartlist_free(cfx->legs);
 
-  SMARTLIST_FOREACH(cfx->ooo_q, conflux_cell_t *, cell, tor_free(cell));
+  SMARTLIST_FOREACH(cfx->ooo_q, conflux_msg_t *, cell,
+                    conflux_relay_msg_free(cell));
   smartlist_free(cfx->ooo_q);
 
   memwipe(cfx->nonce, 0, sizeof(cfx->nonce));
@@ -675,7 +676,7 @@ unlinked_close_or_free(unlinked_circuits_t *unlinked)
 /** Upon an error condition or a close of an in-use circuit, we must close all
  * linked and unlinked circuits associated with a set. When the last leg of
  * each set is closed, the set is removed from the pool. */
-static void
+void
 conflux_mark_all_for_close(const uint8_t *nonce, bool is_client, int reason)
 {
   /* It is possible that for a nonce we have both an unlinked set and a linked
@@ -1162,10 +1163,22 @@ conflux_launch_leg(const uint8_t *nonce)
   origin_circuit_t *circ =
     circuit_establish_circuit_conflux(nonce, CIRCUIT_PURPOSE_CONFLUX_UNLINKED,
                                       exit, flags);
-  if (!circ) {
+
+  /* The above call to establish a circuit can send us back a closed
+   * circuit if the OOM handler closes this very circuit while in that
+   * function. OOM handler runs everytime we queue a cell on a circuit which
+   * the above function does with the CREATE cell.
+   *
+   * The BUG() checks after are in the same spirit which is that there are so
+   * many things that can happen in that establish circuit function that we
+   * ought to make sure we have a valid nonce and a valid conflux object. */
+  if (!circ || TO_CIRCUIT(circ)->marked_for_close) {
     goto err;
   }
-  tor_assert(TO_CIRCUIT(circ)->conflux_pending_nonce);
+  /* We think this won't happen but it might. The maze is powerful. #41155 */
+  if (BUG(!TO_CIRCUIT(circ)->conflux_pending_nonce || !unlinked->cfx)) {
+    goto err;
+  }
 
   /* At this point, the unlinked object has either a new conflux_t or the one
    * used by a linked set so it is fine to use the cfx from the unlinked object
@@ -1477,8 +1490,11 @@ unlinked_circuit_closed(circuit_t *circ)
   /* If no more legs, opportunistically free the unlinked set. */
   if (smartlist_len(unlinked->legs) == 0) {
     unlinked_pool_del_and_free(unlinked, is_client);
-  } else if (!shutting_down) {
-    /* Launch a new leg for this set to recover. */
+  } else if (!shutting_down && !have_been_under_memory_pressure()) {
+    /* Launch a new leg for this set to recover if we are not shutting down or
+     * if we are not under memory pressure. We must not launch legs under
+     * memory pressure else it can just create a feedback loop of being closed
+     * by the OOM handler and relaunching, rinse and repeat. */
     if (CIRCUIT_IS_ORIGIN(circ)) {
       conflux_launch_leg(nonce);
     }
@@ -1624,7 +1640,22 @@ linked_circuit_free(circuit_t *circ, bool is_client)
 
   /* Circuit can be freed without being closed and so we try to delete this leg
    * so we can learn if this circuit is the last leg or not. */
-  cfx_del_leg(circ->conflux, circ);
+  if (cfx_del_leg(circ->conflux, circ)) {
+    /* Check for instances of bug #40870, which we suspect happen
+     * during exit. If any happen outside of exit, BUG and warn. */
+    if (!circ->conflux->in_full_teardown) {
+      /* We should bug and warn if we're not in a shutdown process; that
+       * means we got here somehow without a close. */
+      if (BUG(!shutting_down)) {
+        log_warn(LD_BUG,
+                 "Conflux circuit %p being freed without being marked for "
+                 "full teardown via close, with shutdown state %d. "
+                 "Please report this.", circ, shutting_down);
+        conflux_log_set(LOG_WARN, circ->conflux, is_client);
+      }
+      circ->conflux->in_full_teardown = true;
+    }
+  }
 
   if (CONFLUX_NUM_LEGS(circ->conflux) > 0) {
     /* The last leg will free the streams but until then, we nullify to avoid
@@ -1748,14 +1779,13 @@ conflux_circuit_has_opened(origin_circuit_t *orig_circ)
 
 /** Process a CONFLUX_LINK cell which arrived on the given circuit. */
 void
-conflux_process_link(circuit_t *circ, const cell_t *cell,
-                     const uint16_t cell_len)
+conflux_process_link(circuit_t *circ, const relay_msg_t *msg)
 {
   unlinked_circuits_t *unlinked = NULL;
   conflux_cell_link_t *link = NULL;
 
   tor_assert(circ);
-  tor_assert(cell);
+  tor_assert(msg);
 
   if (!conflux_is_enabled(circ)) {
     circuit_mark_for_close(circ, END_CIRC_REASON_TORPROTOCOL);
@@ -1795,7 +1825,7 @@ conflux_process_link(circuit_t *circ, const cell_t *cell,
   }
 
   /* On errors, logging is emitted in this parsing function. */
-  link = conflux_cell_parse_link(cell, cell_len);
+  link = conflux_cell_parse_link(msg);
   if (!link) {
     log_fn(LOG_PROTOCOL_WARN, LD_CIRC, "Unable to parse "
            "CONFLUX_LINK cell. Closing circuit.");
@@ -1860,8 +1890,7 @@ conflux_process_link(circuit_t *circ, const cell_t *cell,
 /** Process a CONFLUX_LINKED cell which arrived on the given circuit. */
 void
 conflux_process_linked(circuit_t *circ, crypt_path_t *layer_hint,
-                       const cell_t *cell,
-                       const uint16_t cell_len)
+                       const relay_msg_t *msg)
 {
   conflux_cell_link_t *link = NULL;
 
@@ -1921,7 +1950,7 @@ conflux_process_linked(circuit_t *circ, crypt_path_t *layer_hint,
   tor_assert_nonfatal(circ->purpose == CIRCUIT_PURPOSE_CONFLUX_UNLINKED);
 
   /* On errors, logging is emitted in this parsing function. */
-  link = conflux_cell_parse_link(cell, cell_len);
+  link = conflux_cell_parse_link(msg);
   if (!link) {
     goto close;
   }
@@ -1993,7 +2022,7 @@ conflux_process_linked(circuit_t *circ, crypt_path_t *layer_hint,
   }
 
   /* This cell is now considered valid for clients. */
-  circuit_read_valid_data(TO_ORIGIN_CIRCUIT(circ), cell_len);
+  circuit_read_valid_data(TO_ORIGIN_CIRCUIT(circ), msg->length);
 
   goto end;
 
@@ -2098,7 +2127,10 @@ conflux_pool_init(void)
 void
 conflux_log_set(int loglevel, const conflux_t *cfx, bool is_client)
 {
-  tor_assert(cfx);
+  /* This could be called on a closed circuit. */
+  if (cfx == NULL) {
+    return;
+  }
 
   log_fn(loglevel,
           LD_BUG,
@@ -2146,14 +2178,36 @@ conflux_log_set(int loglevel, const conflux_t *cfx, bool is_client)
   }
 }
 
+/**
+ * Conflux needs a notification when tor_shutdown() begins, so that
+ * when circuits are freed, new legs are not launched.
+ *
+ * This needs a separate notification from conflux_pool_free_all(),
+ * because circuits must be freed before that function.
+ */
+void
+conflux_notify_shutdown(void)
+{
+  shutting_down = true;
+}
+
+#ifdef TOR_UNIT_TESTS
+/**
+ * For unit tests: Clear the shutting down state so we resume building legs.
+ */
+void
+conflux_clear_shutdown(void)
+{
+  shutting_down = false;
+}
+#endif
+
 /** Free and clean up the conflux pool subsystem. This is called by the subsys
  * manager AFTER all circuits have been freed which implies that all objects in
  * the pools aren't referenced anymore. */
 void
 conflux_pool_free_all(void)
 {
-  shutting_down = true;
-
   digest256map_free(client_linked_pool, free_conflux_void_);
   digest256map_free(server_linked_pool, free_conflux_void_);
   digest256map_free(client_unlinked_pool, free_unlinked_void_);

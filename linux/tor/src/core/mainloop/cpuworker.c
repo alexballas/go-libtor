@@ -113,10 +113,8 @@ cpuworker_consensus_has_changed(const networkstatus_t *ns)
   set_max_pending_tasks(ns);
 }
 
-/** Initialize the cpuworker subsystem. It is OK to call this more than once
- * during Tor's lifetime.
- */
-void
+/** Initialize the cpuworker subsystem. */
+int
 cpuworker_init(void)
 {
   /*
@@ -132,11 +130,18 @@ cpuworker_init(void)
                               worker_state_free_void,
                               NULL);
 
+  if (!threadpool) {
+    log_err(LD_GENERAL, "Can't create worker thread pool");
+    return -1;
+  }
+
   int r = threadpool_register_reply_event(threadpool, NULL);
 
   tor_assert(r == 0);
 
   set_max_pending_tasks(NULL);
+
+  return 0;
 }
 
 /** Free all resources allocated by cpuworker. */
@@ -208,7 +213,9 @@ typedef struct cpuworker_reply_t {
   /** The created cell to send back. */
   created_cell_t created_cell;
   /** The keys to use on this circuit. */
-  uint8_t keys[CPATH_KEY_MATERIAL_LEN];
+  uint8_t keys[MAX_RELAY_KEY_MATERIAL_LEN];
+  /** Length of the generated key material. */
+  size_t keys_len;
   /** Input to use for authenticating introduce1 cells. */
   uint8_t rend_auth_material[DIGEST_LEN];
   /** Negotiated circuit parameters. */
@@ -446,9 +453,12 @@ cpuworker_onion_handshake_replyfn(void *work_)
     }
   }
 
+  circ->relay_cell_format = rpl.circ_params.cell_fmt;
+
   if (onionskin_answer(circ,
                        &rpl.created_cell,
-                       (const char*)rpl.keys, sizeof(rpl.keys),
+                       rpl.circ_params.crypto_alg,
+                       (const char*)rpl.keys, rpl.keys_len,
                        rpl.rend_auth_material) < 0) {
     log_warn(LD_OR,"onionskin_answer failed. Closing.");
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
@@ -490,15 +500,17 @@ cpuworker_onion_handshake_threadfn(void *state_, void *work_)
   rpl.handshake_type = cc->handshake_type;
   if (req.timed)
     tor_gettimeofday(&tv_start);
+  rpl.keys_len = sizeof(rpl.keys);
   n = onion_skin_server_handshake(cc->handshake_type,
                                   cc->onionskin, cc->handshake_len,
                                   onion_keys,
                                   &req.circ_ns_params,
                                   cell_out->reply,
                                   sizeof(cell_out->reply),
-                                  rpl.keys, CPATH_KEY_MATERIAL_LEN,
+                                  rpl.keys, &rpl.keys_len,
                                   rpl.rend_auth_material,
                                   &rpl.circ_params);
+
   if (n < 0) {
     /* failure */
     log_debug(LD_OR,"onion_skin_server_handshake failed.");

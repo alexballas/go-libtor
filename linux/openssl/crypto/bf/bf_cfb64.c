@@ -1,11 +1,17 @@
 /*
- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
  *
- * Licensed under the OpenSSL license (the "License").  You may not use
+ * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+
+/*
+ * BF low level APIs are deprecated for public use, but still ok for internal
+ * use.
+ */
+#include "internal/deprecated.h"
 
 #include <openssl/blowfish.h>
 #include "bf_local.h"
@@ -17,8 +23,8 @@
  */
 
 void BF_cfb64_encrypt(const unsigned char *in, unsigned char *out,
-                      long length, const BF_KEY *schedule,
-                      unsigned char *ivec, int *num, int encrypt)
+    long length, const BF_KEY *schedule,
+    unsigned char *ivec, int *num, int encrypt)
 {
     register BF_LONG v0, v1, t;
     register int n = *num;

@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -28,17 +30,22 @@ var genLock = flag.Bool("update", false, "Pulls new commits, if unset the libs c
 func main() {
 	flag.Parse()
 	var lock *lockJson
-	if !*genLock {
-		lock = &lockJson{}
-		f, err := os.Open("lock.json")
-		if err != nil {
-			panic(err)
-		}
-		err = json.NewDecoder(f).Decode(lock)
+	var currentLock *lockJson
+	if f, err := os.Open("lock.json"); err == nil {
+		currentLock = &lockJson{}
+		err = json.NewDecoder(f).Decode(currentLock)
 		f.Close()
 		if err != nil {
 			panic(err)
 		}
+	} else if !os.IsNotExist(err) {
+		panic(err)
+	}
+	if !*genLock {
+		if currentLock == nil {
+			panic(errors.New("missing lock.json"))
+		}
+		lock = currentLock
 	}
 
 	// TarGeT stores the target to generate, the idea is a target is block of oses
@@ -88,7 +95,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	torVer, torHash, err := wrapTor(tgt, lock)
+	torLock := lock
+	if *genLock {
+		torLock = currentLock
+	}
+	torVer, torHash, err := wrapTor(tgt, torLock)
 	if err != nil {
 		panic(err)
 	}
@@ -111,19 +122,21 @@ func main() {
 
 	// Update
 	if *genLock {
-		tmpl := template.Must(template.ParseFiles(filepath.Join("build", "README.md")))
-		buf := new(bytes.Buffer)
-		tmpl.Execute(buf, map[string]string{
-			"zlibVer":      zlibVer,
-			"zlibHash":     zlibHash,
-			"libeventVer":  libeventVer,
-			"libeventHash": libeventHash,
-			"opensslVer":   opensslVer,
-			"opensslHash":  opensslHash,
-			"torVer":       torVer,
-			"torHash":      torHash,
-		})
-		ioutil.WriteFile("README.md", buf.Bytes(), 0644)
+		if _, err := os.Stat(filepath.Join("build", "README.md")); err == nil {
+			tmpl := template.Must(template.ParseFiles(filepath.Join("build", "README.md")))
+			buf := new(bytes.Buffer)
+			tmpl.Execute(buf, map[string]string{
+				"zlibVer":      zlibVer,
+				"zlibHash":     zlibHash,
+				"libeventVer":  libeventVer,
+				"libeventHash": libeventHash,
+				"opensslVer":   opensslVer,
+				"opensslHash":  opensslHash,
+				"torVer":       torVer,
+				"torHash":      torHash,
+			})
+			ioutil.WriteFile("README.md", buf.Bytes(), 0644)
+		}
 		buff, err := json.Marshal(lockJson{
 			Zlib:     zlibHash,
 			Libevent: libeventHash,
@@ -137,11 +150,363 @@ func main() {
 	}
 }
 
+type versionTag struct {
+	Name       string
+	Version    []int
+	Prerelease int
+}
+
+func listGitTags(repo string, pattern string) ([]string, error) {
+	lister := exec.Command("git", "tag", "--list", pattern)
+	lister.Dir = repo
+
+	out, err := lister.CombinedOutput()
+	if err != nil {
+		fmt.Println(string(out))
+		return nil, err
+	}
+	tags := strings.Fields(string(out))
+	sort.Strings(tags)
+
+	return tags, nil
+}
+
+func parseVersionParts(raw string) ([]int, error) {
+	parts := strings.Split(raw, ".")
+	version := make([]int, len(parts))
+
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, err
+		}
+		version[i] = n
+	}
+	return version, nil
+}
+
+func compareVersionParts(a, b []int) int {
+	limit := len(a)
+	if len(b) > limit {
+		limit = len(b)
+	}
+	for i := 0; i < limit; i++ {
+		var ai, bi int
+		if i < len(a) {
+			ai = a[i]
+		}
+		if i < len(b) {
+			bi = b[i]
+		}
+		if ai < bi {
+			return -1
+		}
+		if ai > bi {
+			return 1
+		}
+	}
+	return 0
+}
+
+func uniqueStrings(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func extractLibeventObjects(out string) []string {
+	matches := regexp.MustCompile(`(?m)(?:^|[[:space:]])([a-z0-9_]+)\.lo(?:[[:space:];]|$)`).FindAllStringSubmatch(out, -1)
+	deps := make([]string, 0, len(matches))
+	for _, match := range matches {
+		deps = append(deps, match[1])
+	}
+	return uniqueStrings(deps)
+}
+
+func extractOpenSSLSources(out string) []string {
+	matches := regexp.MustCompile(`(?m)-c\s+-o\s+(\S+)\s+([A-Za-z0-9_./+-]+)\.c(?:\s|$)`).FindAllStringSubmatch(out, -1)
+	deps := make([]string, 0, len(matches))
+	for _, match := range matches {
+		object := strings.TrimPrefix(match[1], "./")
+		if !strings.Contains(object, "libcrypto-lib-") &&
+			!strings.Contains(object, "libssl-lib-") &&
+			!strings.Contains(object, "libcommon-lib-") &&
+			!strings.Contains(object, "libdefault-lib-") {
+			continue
+		}
+		deps = append(deps, strings.TrimPrefix(match[2], "./"))
+	}
+	return uniqueStrings(deps)
+}
+
+func libeventPrereleaseRank(label string) int {
+	switch label {
+	case "", "stable":
+		return 4
+	case "rc":
+		return 3
+	case "beta":
+		return 2
+	case "alpha", "alpha-dev", "dev":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func latestZlibTag(repo string) (string, error) {
+	tags, err := listGitTags(repo, "v*")
+	if err != nil {
+		return "", err
+	}
+	re := regexp.MustCompile(`^v([0-9]+(?:\.[0-9]+)*)$`)
+
+	var best *versionTag
+	for _, tag := range tags {
+		match := re.FindStringSubmatch(tag)
+		if len(match) == 0 {
+			continue
+		}
+		version, err := parseVersionParts(match[1])
+		if err != nil {
+			return "", err
+		}
+		candidate := &versionTag{Name: tag, Version: version}
+		if best == nil || compareVersionParts(candidate.Version, best.Version) > 0 {
+			best = candidate
+		}
+	}
+	if best == nil {
+		return "", errors.New("no zlib release tag found")
+	}
+	return best.Name, nil
+}
+
+func latestLibeventTag(repo string) (string, error) {
+	tags, err := listGitTags(repo, "release-*")
+	if err != nil {
+		return "", err
+	}
+	re := regexp.MustCompile(`^release-([0-9]+(?:\.[0-9]+){2})(?:-([A-Za-z0-9.-]+))?$`)
+
+	var best *versionTag
+	for _, tag := range tags {
+		match := re.FindStringSubmatch(tag)
+		if len(match) == 0 {
+			continue
+		}
+		version, err := parseVersionParts(match[1])
+		if err != nil {
+			return "", err
+		}
+		label := strings.ToLower(match[2])
+		candidate := &versionTag{
+			Name:       tag,
+			Version:    version,
+			Prerelease: libeventPrereleaseRank(label),
+		}
+		if best == nil {
+			best = candidate
+			continue
+		}
+		if cmp := compareVersionParts(candidate.Version, best.Version); cmp > 0 {
+			best = candidate
+			continue
+		} else if cmp == 0 && candidate.Prerelease > best.Prerelease {
+			best = candidate
+		}
+	}
+	if best == nil {
+		return "", errors.New("no libevent release tag found")
+	}
+	return best.Name, nil
+}
+
+func latestOpenSSLTag(repo string) (string, error) {
+	tags, err := listGitTags(repo, "openssl-*")
+	if err != nil {
+		return "", err
+	}
+	re := regexp.MustCompile(`^openssl-([0-9]+(?:\.[0-9]+){2})$`)
+
+	var best *versionTag
+	for _, tag := range tags {
+		match := re.FindStringSubmatch(tag)
+		if len(match) == 0 {
+			continue
+		}
+		version, err := parseVersionParts(match[1])
+		if err != nil {
+			return "", err
+		}
+		candidate := &versionTag{Name: tag, Version: version}
+		if best == nil || compareVersionParts(candidate.Version, best.Version) > 0 {
+			best = candidate
+		}
+	}
+	if best == nil {
+		return "", errors.New("no OpenSSL release tag found")
+	}
+	return best.Name, nil
+}
+
+func openSSLVersionData(repo string) (map[string]string, error) {
+	blob, err := ioutil.ReadFile(filepath.Join(repo, "VERSION.dat"))
+	if err != nil {
+		return nil, err
+	}
+	parse := func(key string) (string, error) {
+		re := regexp.MustCompile(`(?m)^` + key + `="?([^"\n]+)"?$`)
+		match := re.FindSubmatch(blob)
+		if len(match) == 0 {
+			return "", fmt.Errorf("could not parse OpenSSL %s", strings.ToLower(key))
+		}
+		return string(match[1]), nil
+	}
+	fields := map[string]string{}
+	for _, key := range []string{"MAJOR", "MINOR", "PATCH", "SHLIB_VERSION"} {
+		value, err := parse(key)
+		if err != nil {
+			return nil, err
+		}
+		fields[key] = value
+	}
+	for _, key := range []string{"PRE_RELEASE_TAG", "BUILD_METADATA", "RELEASE_DATE"} {
+		re := regexp.MustCompile(`(?m)^` + key + `="?([^"\n]*)"?$`)
+		match := re.FindSubmatch(blob)
+		if len(match) == 0 {
+			return nil, fmt.Errorf("could not parse OpenSSL %s", strings.ToLower(key))
+		}
+		fields[key] = string(match[1])
+	}
+	return fields, nil
+}
+
+func openSSLVersion(repo string) (string, error) {
+	fields, err := openSSLVersionData(repo)
+	if err != nil {
+		return "", err
+	}
+	version := strings.Join([]string{fields["MAJOR"], fields["MINOR"], fields["PATCH"]}, ".")
+	if fields["PRE_RELEASE_TAG"] != "" {
+		version += fields["PRE_RELEASE_TAG"]
+	}
+	return version, nil
+}
+
+func writeOpenSSLVersionHeader(path string, fields map[string]string) error {
+	version := strings.Join([]string{fields["MAJOR"], fields["MINOR"], fields["PATCH"]}, ".")
+	fullVersion := version + fields["PRE_RELEASE_TAG"] + fields["BUILD_METADATA"]
+
+	tmpl, err := template.New("").Parse(`/*
+ * Generated by go-libtor's wrapper.
+ */
+
+#ifndef OPENSSL_OPENSSLV_H
+#define OPENSSL_OPENSSLV_H
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define OPENSSL_VERSION_MAJOR {{.Major}}
+#define OPENSSL_VERSION_MINOR {{.Minor}}
+#define OPENSSL_VERSION_PATCH {{.Patch}}
+#define OPENSSL_VERSION_PRE_RELEASE "{{.PreRelease}}"
+#define OPENSSL_VERSION_BUILD_METADATA "{{.BuildMetadata}}"
+#define OPENSSL_SHLIB_VERSION {{.ShlibVersion}}
+#define OPENSSL_VERSION_PREREQ(maj, min) \
+    ((OPENSSL_VERSION_MAJOR << 16) + OPENSSL_VERSION_MINOR >= ((maj) << 16) + (min))
+#define OPENSSL_VERSION_STR "{{.Version}}"
+#define OPENSSL_FULL_VERSION_STR "{{.FullVersion}}"
+#define OPENSSL_RELEASE_DATE "{{.ReleaseDate}}"
+#define OPENSSL_VERSION_TEXT "OpenSSL {{.FullVersion}} {{.ReleaseDate}}"
+#define OPENSSL_VERSION_NUMBER          \
+    ( (OPENSSL_VERSION_MAJOR<<28)        \
+      |(OPENSSL_VERSION_MINOR<<20)       \
+      |(OPENSSL_VERSION_PATCH<<4)        \
+      |0x0L )
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+`)
+	if err != nil {
+		return err
+	}
+	buff := new(bytes.Buffer)
+	if err := tmpl.Execute(buff, map[string]string{
+		"Major":         fields["MAJOR"],
+		"Minor":         fields["MINOR"],
+		"Patch":         fields["PATCH"],
+		"PreRelease":    fields["PRE_RELEASE_TAG"],
+		"BuildMetadata": fields["BUILD_METADATA"],
+		"ShlibVersion":  fields["SHLIB_VERSION"],
+		"Version":       version,
+		"FullVersion":   fullVersion,
+		"ReleaseDate":   fields["RELEASE_DATE"],
+	}); err != nil {
+		return err
+	}
+	return ioutil.WriteFile(path, buff.Bytes(), 0644)
+}
+
 // targetFilters maps a build target to the builds tags to apply to it
 var targetFilters = map[string]string{
-	"linux":   "linux android",
-	"darwin":  "darwin,amd64 darwin,arm64 ios,amd64 ios,arm64",
-	"windows": "windows,amd64 windows,386",
+	"linux":   "linux || android",
+	"darwin":  "(darwin && (amd64 || arm64)) || (ios && (amd64 || arm64))",
+	"windows": "windows && (amd64 || 386)",
+}
+
+func openSSLConfigureTarget() (string, error) {
+	switch runtime.GOOS {
+	case "linux":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "linux-x86_64", nil
+		case "386":
+			return "linux-x86", nil
+		case "arm64":
+			return "linux-aarch64", nil
+		case "arm":
+			return "linux-armv4", nil
+		}
+	case "darwin":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "darwin64-x86_64-cc", nil
+		case "arm64":
+			return "darwin64-arm64-cc", nil
+		}
+	case "windows":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "mingw64", nil
+		case "386":
+			return "mingw", nil
+		}
+	}
+	return "", fmt.Errorf("unsupported OpenSSL configure target for %s/%s", runtime.GOOS, runtime.GOARCH)
 }
 
 // lockJson stores the commits for later reuse.
@@ -171,14 +536,21 @@ func wrapZlib(tgt string, lock *lockJson) (string, string, error) {
 		return "", "", err
 	}
 
-	// If we have a commit lock, checkout these commits.
+	var checkout string
 	if lock != nil {
-		checkouter := exec.Command("git", "checkout", lock.Zlib)
-		checkouter.Dir = tgtf
-
-		if err := checkouter.Run(); err != nil {
+		checkout = lock.Zlib
+	} else {
+		var err error
+		checkout, err = latestZlibTag(tgtf)
+		if err != nil {
 			return "", "", err
 		}
+	}
+	checkouter := exec.Command("git", "checkout", checkout)
+	checkouter.Dir = tgtf
+
+	if err := checkouter.Run(); err != nil {
+		return "", "", err
 	}
 
 	// Save the latest upstream commit hash for later reference
@@ -305,14 +677,21 @@ func wrapLibevent(tgt string, lock *lockJson) (string, string, error) {
 		return "", "", err
 	}
 
-	// If we have a commit lock, checkout these commits.
+	var checkout string
 	if lock != nil {
-		checkouter := exec.Command("git", "checkout", lock.Libevent)
-		checkouter.Dir = tgtf
-
-		if err := checkouter.Run(); err != nil {
+		checkout = lock.Libevent
+	} else {
+		var err error
+		checkout, err = latestLibeventTag(tgtf)
+		if err != nil {
 			return "", "", err
 		}
+	}
+	checkouter := exec.Command("git", "checkout", checkout)
+	checkouter.Dir = tgtf
+
+	if err := checkouter.Run(); err != nil {
+		return "", "", err
 	}
 
 	// Save the latest upstream commit hash for later reference
@@ -335,13 +714,34 @@ func wrapLibevent(tgt string, lock *lockJson) (string, string, error) {
 	if err := autogen.Run(); err != nil {
 		return "", "", err
 	}
-	configure := exec.Command("./configure", "--disable-shared", "--enable-static", "--enable-openssl", "--disable-libevent-regress",
-		"--enable-thread-support", "--disable-samples", "--disable-verbose-debug", "--disable-malloc-replacement")
+	configure := exec.Command("./configure", "--disable-shared", "--enable-static", "--enable-openssl", "--disable-mbedtls",
+		"--disable-libevent-regress", "--enable-thread-support", "--disable-samples", "--disable-verbose-debug",
+		"--disable-malloc-replacement")
 	configure.Dir = tgtf
 	configure.Stdout = os.Stdout
 	configure.Stderr = os.Stderr
 
 	if err := configure.Run(); err != nil {
+		return "", "", err
+	}
+	// Build and stage libevent locally so Tor can link against it during its
+	// configure checks without requiring distro-level libevent-dev packages.
+	libeventPrefix, err := filepath.Abs(filepath.Join("builddeps", "libevent"))
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.RemoveAll(libeventPrefix); err != nil {
+		return "", "", err
+	}
+	if err := os.MkdirAll(libeventPrefix, 0755); err != nil {
+		return "", "", err
+	}
+	installer := exec.Command("make", fmt.Sprintf("-j%d", runtime.NumCPU()), "install", "DESTDIR="+libeventPrefix)
+	installer.Dir = tgtf
+	installer.Stdout = os.Stdout
+	installer.Stderr = os.Stderr
+
+	if err := installer.Run(); err != nil {
 		return "", "", err
 	}
 	// Retrieve the version of the current commit
@@ -358,7 +758,18 @@ func wrapLibevent(tgt string, lock *lockJson) (string, string, error) {
 		fmt.Println(string(out))
 		return "", "", err
 	}
-	deps := regexp.MustCompile(" ([a-z0-9_]+)\\.lo;").FindAllStringSubmatch(string(out), -1)
+	deps := extractLibeventObjects(string(out))
+	if len(deps) == 0 {
+		return "", "", errors.New("failed to detect libevent object files from make --dry-run output")
+	}
+	if containsString(deps, "ws") {
+		if _, err := os.Stat(filepath.Join(tgtf, "sha1.c")); err == nil && !containsString(deps, "sha1") {
+			deps = append(deps, "sha1")
+			sort.Strings(deps)
+		} else if err != nil && !os.IsNotExist(err) {
+			return "", "", err
+		}
+	}
 
 	// Wipe everything from the library that's non-essential
 	files, err := ioutil.ReadDir(tgtf)
@@ -395,11 +806,11 @@ func wrapLibevent(tgt string, lock *lockJson) (string, string, error) {
 		buff := new(bytes.Buffer)
 		if err := tmpl.Execute(buff, map[string]string{
 			"TargetFilter": tgtFilt,
-			"File":         dep[1],
+			"File":         dep,
 		}); err != nil {
 			return "", "", err
 		}
-		ioutil.WriteFile(filepath.Join("libtor", tgt+"_libevent_"+dep[1]+".go"), buff.Bytes(), 0644)
+		ioutil.WriteFile(filepath.Join("libtor", tgt+"_libevent_"+dep+".go"), buff.Bytes(), 0644)
 	}
 	tmpl, err = template.New("").Parse(libeventPreamble)
 	if err != nil {
@@ -441,7 +852,6 @@ var libeventPreamble = `// go-libtor - Self-contained Tor from Go
 package libtor
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../libevent_config
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/libevent
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/libevent/compat
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/libevent/include
@@ -460,7 +870,16 @@ var libeventTemplate = `// go-libtor - Self-contained Tor from Go
 package libtor
 
 /*
+#include <event2/event-config.h>
+#include <evconfig-private.h>
 #include <compat/sys/queue.h>
+#if !defined(BIG_ENDIAN) && !defined(LITTLE_ENDIAN)
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define BIG_ENDIAN 1
+#else
+#define LITTLE_ENDIAN 1
+#endif
+#endif
 #include <../{{.File}}.c>
 */
 import "C"
@@ -493,29 +912,20 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 		return "", "", err
 	}
 
-	// OpenSSL is a security concern, switch to the latest stable code
-	brancher := exec.Command("git", "branch", "-a")
-	brancher.Dir = tgtf
-
-	out, err := brancher.CombinedOutput()
-	if err != nil {
-		return "", "", err
-	}
-	stables := regexp.MustCompile("remotes/origin/(OpenSSL_[0-9]_[0-9]_[0-9]-stable)").FindAllSubmatch(out, -1)
-	if len(stables) == 0 {
-		return "", "", errors.New("no stable branch found")
-	}
 	var checkout string
-	// If we have a commit lock, checkout these commits.
 	if lock != nil {
 		checkout = lock.Openssl
 	} else {
-		checkout = string(stables[len(stables)-1][1])
+		var err error
+		checkout, err = latestOpenSSLTag(tgtf)
+		if err != nil {
+			return "", "", err
+		}
 	}
 	switcher := exec.Command("git", "checkout", checkout)
 	switcher.Dir = tgtf
 
-	if out, err = switcher.CombinedOutput(); err != nil {
+	if out, err := switcher.CombinedOutput(); err != nil {
 		fmt.Println(string(out))
 		return "", "", err
 	}
@@ -541,11 +951,21 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 	}
 	date = bytes.TrimSpace(date)
 
-	// Extract the version string
-	strver := bytes.Replace(stables[len(stables)-1][1], []byte("_"), []byte("."), -1)[len("OpenSSL_"):]
+	versionData, err := openSSLVersionData(tgtf)
+	if err != nil {
+		return "", "", err
+	}
+	strver := strings.Join([]string{versionData["MAJOR"], versionData["MINOR"], versionData["PATCH"]}, ".")
+	if versionData["PRE_RELEASE_TAG"] != "" {
+		strver += versionData["PRE_RELEASE_TAG"]
+	}
 
-	// Configure the library for compilation
-	config := exec.Command("./Configure", "no-shared", "no-zlib", "no-asm", "no-async", "no-sctp")
+	// Configure the library for compilation.
+	opensslTarget, err := openSSLConfigureTarget()
+	if err != nil {
+		return "", "", err
+	}
+	config := exec.Command("./Configure", opensslTarget, "no-shared", "no-zlib", "no-asm", "no-async", "no-sctp")
 	config.Dir = tgtf
 	config.Stdout = os.Stdout
 	config.Stderr = os.Stderr
@@ -553,15 +973,53 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 	if err := config.Run(); err != nil {
 		return "", "", err
 	}
+	generator := exec.Command("make", "build_generated")
+	generator.Dir = tgtf
+	generator.Stdout = os.Stdout
+	generator.Stderr = os.Stderr
+
+	if err := generator.Run(); err != nil {
+		return "", "", err
+	}
 	// Hook the make system and gather the needed sources
 	maker := exec.Command("make", "--dry-run")
 	maker.Dir = tgtf
 
-	if out, err = maker.CombinedOutput(); err != nil {
+	out, err := maker.CombinedOutput()
+	if err != nil {
 		fmt.Println(string(out))
 		return "", "", err
 	}
-	deps := regexp.MustCompile("(?m)([a-z0-9_/-]+)\\.c$").FindAllStringSubmatch(string(out), -1)
+	deps := extractOpenSSLSources(string(out))
+	if len(deps) == 0 {
+		return "", "", errors.New("failed to detect openssl source files from make --dry-run output")
+	}
+	var generatedDeps []string
+	for _, dep := range deps {
+		source := filepath.Join(tgtf, dep+".c")
+		if _, err := os.Stat(source); err == nil {
+			continue
+		}
+		if !os.IsNotExist(err) {
+			return "", "", err
+		}
+		if _, err := os.Stat(filepath.Join(tgtf, dep+".c.in")); err == nil {
+			generatedDeps = append(generatedDeps, dep+".c")
+		} else if !os.IsNotExist(err) {
+			return "", "", err
+		}
+	}
+	if len(generatedDeps) > 0 {
+		sort.Strings(generatedDeps)
+		generator := exec.Command("make", generatedDeps...)
+		generator.Dir = tgtf
+		generator.Stdout = os.Stdout
+		generator.Stderr = os.Stderr
+
+		if err := generator.Run(); err != nil {
+			return "", "", err
+		}
+	}
 
 	// Wipe everything from the library that's non-essential
 	files, err := ioutil.ReadDir(tgtf)
@@ -571,7 +1029,7 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 	for _, file := range files {
 		// Remove all folders apart from the headers
 		if file.IsDir() {
-			if file.Name() == "crypto" || file.Name() == "engines" || file.Name() == "include" || file.Name() == "ssl" {
+			if file.Name() == "crypto" || file.Name() == "engines" || file.Name() == "include" || file.Name() == "providers" || file.Name() == "ssl" {
 				continue
 			}
 			os.RemoveAll(filepath.Join(tgtf, file.Name()))
@@ -594,27 +1052,37 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	wrapperCount := 0
 	for _, dep := range deps {
 		// Skip any files not needed for the library
-		if strings.HasPrefix(dep[1], "apps/") {
+		if strings.HasPrefix(dep, "apps/") {
 			continue
 		}
-		if strings.HasPrefix(dep[1], "fuzz/") {
+		if strings.HasPrefix(dep, "fuzz/") {
 			continue
 		}
-		if strings.HasPrefix(dep[1], "test/") {
+		if strings.HasPrefix(dep, "test/") {
+			continue
+		}
+		if strings.HasSuffix(dep, "_test") {
 			continue
 		}
 		// Anything else is wrapped directly with Go
-		gofile := strings.Replace(dep[1], "/", "_", -1) + ".go"
+		gofile := strings.Replace(dep, "/", "_", -1) + ".go"
 		buff := new(bytes.Buffer)
 		if err := tmpl.Execute(buff, map[string]string{
 			"TargetFilter": tgtFilt,
-			"File":         dep[1],
+			"File":         dep,
 		}); err != nil {
 			return "", "", err
 		}
-		ioutil.WriteFile(filepath.Join("libtor", tgt+"_openssl_"+gofile), buff.Bytes(), 0644)
+		if err := ioutil.WriteFile(filepath.Join("libtor", tgt+"_openssl_"+gofile), buff.Bytes(), 0644); err != nil {
+			return "", "", err
+		}
+		wrapperCount++
+	}
+	if wrapperCount == 0 {
+		return "", "", errors.New("no openssl wrapper files generated after filtering")
 	}
 	tmpl, err = template.New("").Parse(opensslPreamble)
 	if err != nil {
@@ -627,10 +1095,16 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 	}); err != nil {
 		return "", "", err
 	}
-	ioutil.WriteFile(filepath.Join("libtor", tgt+"_openssl_preamble.go"), buff.Bytes(), 0644)
+	if err := ioutil.WriteFile(filepath.Join("libtor", tgt+"_openssl_preamble.go"), buff.Bytes(), 0644); err != nil {
+		return "", "", err
+	}
 
-	// Inject the configuration headers and ensure everything builds
+	// Inject the configuration headers and ensure everything builds.
+	if err := os.RemoveAll("openssl_config"); err != nil {
+		return "", "", err
+	}
 	os.MkdirAll(filepath.Join("openssl_config", "crypto"), 0755)
+	os.MkdirAll(filepath.Join("openssl_config", "openssl"), 0755)
 
 	for _, arch := range []string{"", ".linux", ".darwin", ".windows"} {
 		blob, _ := ioutil.ReadFile(filepath.Join("config", "openssl", fmt.Sprintf("dso_conf%s.h", arch)))
@@ -653,11 +1127,30 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 		}
 		ioutil.WriteFile(filepath.Join("openssl_config", fmt.Sprintf("buildinf%s.h", arch)), buff.Bytes(), 0644)
 	}
-	os.MkdirAll(filepath.Join("openssl_config", "openssl"), 0755)
 
-	for _, arch := range []string{"", ".x64", ".x86", ".macos64", ".ios64", ".windows32", ".windows64"} {
-		blob, _ := ioutil.ReadFile(filepath.Join("config", "openssl", fmt.Sprintf("opensslconf%s.h", arch)))
-		ioutil.WriteFile(filepath.Join("openssl_config", "openssl", fmt.Sprintf("opensslconf%s.h", arch)), blob, 0644)
+	if _, err := os.Stat(filepath.Join(tgtf, "include", "openssl", "configuration.h")); err == nil {
+		blob, err := ioutil.ReadFile(filepath.Join(tgtf, "include", "openssl", "opensslconf.h"))
+		if err != nil {
+			return "", "", err
+		}
+		if err := ioutil.WriteFile(filepath.Join("openssl_config", "openssl", "opensslconf.h"), blob, 0644); err != nil {
+			return "", "", err
+		}
+		blob, err = ioutil.ReadFile(filepath.Join(tgtf, "include", "openssl", "configuration.h"))
+		if err != nil {
+			return "", "", err
+		}
+		if err := ioutil.WriteFile(filepath.Join("openssl_config", "openssl", "configuration.h"), blob, 0644); err != nil {
+			return "", "", err
+		}
+		if err := writeOpenSSLVersionHeader(filepath.Join("openssl_config", "openssl", "opensslv.h"), versionData); err != nil {
+			return "", "", err
+		}
+	} else {
+		for _, arch := range []string{"", ".x64", ".x86", ".macos64", ".ios64", ".windows32", ".windows64"} {
+			blob, _ := ioutil.ReadFile(filepath.Join("config", "openssl", fmt.Sprintf("opensslconf%s.h", arch)))
+			ioutil.WriteFile(filepath.Join("openssl_config", "openssl", fmt.Sprintf("opensslconf%s.h", arch)), blob, 0644)
+		}
 	}
 	return string(strver), string(commit), nil
 }
@@ -678,6 +1171,10 @@ package libtor
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/openssl/crypto/ec/curve448/arch_32
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/openssl/crypto/modes
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/openssl/include/openssl
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/openssl/providers/common/include
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/openssl/providers/fips/include
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/openssl/providers/implementations/include
+#cgo CFLAGS: -include ${SRCDIR}/../openssl_config/gotor_extra.h
 */
 import "C"
 `
@@ -748,18 +1245,29 @@ func wrapTor(tgt string, lock *lockJson) (string, string, error) {
 	if err := autogen.Run(); err != nil {
 		return "", "", err
 	}
+	libeventPrefix, err := filepath.Abs(filepath.Join("builddeps", "libevent", "usr", "local"))
+	if err != nil {
+		return "", "", err
+	}
 	configure := exec.Command("./configure", "--disable-asciidoc", "--disable-seccomp",
-		"--disable-libscrypt", "--disable-lzma", "--disable-zstd", "--disable-systemd")
+		"--disable-libscrypt", "--disable-lzma", "--disable-zstd", "--disable-systemd",
+		"--with-libevent-dir="+libeventPrefix)
 	configure.Dir = tgtf
 	configure.Stdout = os.Stdout
 	configure.Stderr = os.Stderr
+	configure.Env = append(os.Environ(),
+		"PKG_CONFIG_PATH="+filepath.Join(libeventPrefix, "lib", "pkgconfig"),
+		"CFLAGS=-I"+filepath.Join(libeventPrefix, "include"),
+		"LDFLAGS=-L"+filepath.Join(libeventPrefix, "lib"),
+	)
 
 	if err := configure.Run(); err != nil {
 		return "", "", err
 	}
-	// Retrieve the version of the current commit
-	winconf, _ := ioutil.ReadFile(filepath.Join(tgtf, "src", "win32", "orconfig.h"))
-	strver := regexp.MustCompile("define VERSION \"(.+)\"").FindSubmatch(winconf)[1]
+	// Retrieve the configured Tor version from the generated top-level header.
+	orconf, _ := ioutil.ReadFile(filepath.Join(tgtf, "orconfig.h"))
+	strver := regexp.MustCompile("define VERSION \"(.+)\"").FindSubmatch(orconf)[1]
+	hasModulePow := regexp.MustCompile(`(?m)^#define HAVE_MODULE_POW 1$`).Match(orconf)
 
 	// Hook the make system and gather the needed sources
 	maker := exec.Command("make", "--dry-run")
@@ -839,6 +1347,9 @@ func wrapTor(tgt string, lock *lockJson) (string, string, error) {
 			continue
 		}
 		if strings.HasPrefix(dep[1], "src/tools/") {
+			continue
+		}
+		if dep[1] == "src/feature/hs/hs_pow" && !hasModulePow {
 			continue
 		}
 		// Skip the main tor entry point, we're wrapping a lib
@@ -929,10 +1440,16 @@ package libtor
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/core/or
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/ext
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/ext/equix/include
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/ext/equix/src
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/ext/equix/hashx/include
+#cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/ext/equix/hashx/src
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/ext/trunnel
 #cgo CFLAGS: -I${SRCDIR}/../{{.Target}}/tor/src/feature/api
 
+#cgo CFLAGS: -D_GNU_SOURCE
 #cgo CFLAGS: -DED25519_CUSTOMRANDOM -DED25519_CUSTOMHASH -DED25519_SUFFIX=_donna
+#cgo CFLAGS: -include ${SRCDIR}/../tor_config/gotor_extra.h
 
 #cgo LDFLAGS: -lm
 #cgo windows LDFLAGS: -lshlwapi

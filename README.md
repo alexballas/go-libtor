@@ -1,48 +1,46 @@
-# go-libtor - Self-contained Tor from Go
+# go-libtor
 
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/gen2brain/go-libtor)](https://pkg.go.dev/github.com/gen2brain/go-libtor)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/alexballas/go-libtor)](https://pkg.go.dev/github.com/alexballas/go-libtor)
 
-The `go-libtor` project is a self-contained, fully statically linked Tor library for Go. It consists of an elaborate suite of Go/CGO wrappers around the original C/C++ Tor library and its dependencies ([zlib](https://github.com/madler/zlib), [libevent](https://github.com/libevent/libevent) and [openssl](https://github.com/openssl/openssl)).
+`go-libtor` embeds Tor and its C dependencies directly into a Go build. The result is a self-contained Go package that can start an in-process Tor instance through CGO, without requiring a system Tor installation.
 
-| Library  | Version | Commit |
-|:-:|:-:|:-:|
-| zlib | 1.2.11 | [`cacf7f1d4e3d44d871b605da3b647f07d718623f`](https://github.com/madler/zlib/commit/cacf7f1d4e3d44d871b605da3b647f07d718623f) |
-| libevent | 2.2.0-alpha-dev | [`0c217f4fe1af6efdb99321401da6f4048398065f`](https://github.com/libevent/libevent/commit/0c217f4fe1af6efdb99321401da6f4048398065f) |
-| openssl | 1.1.1-stable | [`79ef18759a4f89af0b1e015766a73fa289095673`](https://github.com/openssl/openssl/commit/79ef18759a4f89af0b1e015766a73fa289095673) |
-| tor | 0.4.8.13 | [`07777d965abd706f31199a74c507ea30ed72bf92`](https://gitlab.torproject.org/tpo/core/tor/-/commit/07777d965abd706f31199a74c507ea30ed72bf92) |
+This repository is a maintained fork of `gen2brain/go-libtor`. The current module path is:
 
-The library is currently supported on:
-
- - Linux `amd64`, `x86`, `arm64` and `arm`; both with `libc` and `musl`.
- - Android `amd64`, `x86`, `arm64` and `arm`; specifically via `gomobile`.
- - Darwin (Macos and iOS) `amd64` and `arm64`.
- - Windows `amd64` and `386`.
-
-## Installation (Go modules)
-
-This library is compatible with Go modules. All you need is to import `github.com/gen2brain/go-libtor` and wait out the build. We suggest running `go build -v -x` the first time after adding the `go-libtor` dependency to avoid frustration, otherwise Go will build the 1000+ C files without any progress report.
-
-## Installation (GOPATH)
-
-The goal of this library is to be a self-contained Tor package for Go. As such, it plays nice with the usual `go get` workflow. That said, building Tor and all its dependencies locally can take quite a while, so it's recommended to run `go get` in verbose mode.
-
-```
-$ go get -u -v -x github.com/gen2brain/go-libtor
+```text
+github.com/alexballas/go-libtor
 ```
 
-You'll also need the [`bine`](https://github.com/cretz/bine) bindings to interface with the library:
+## Bundled upstreams
 
-```
-go get -u github.com/cretz/bine/tor
+| Library | Version | Commit |
+| :- | :- | :- |
+| zlib | 1.3.2 | [`da607da739fa6047df13e66a2af6b8bec7c2a498`](https://github.com/madler/zlib/commit/da607da739fa6047df13e66a2af6b8bec7c2a498) |
+| libevent | 2.2.1-alpha-dev | [`fe9dc8f614db0520027e8e2adb95769193d4f0a3`](https://github.com/libevent/libevent/commit/fe9dc8f614db0520027e8e2adb95769193d4f0a3) |
+| OpenSSL | 3.6.1 | [`c9a9e5b10105ad850b6e4d1122c645c67767c341`](https://github.com/openssl/openssl/commit/c9a9e5b10105ad850b6e4d1122c645c67767c341) |
+| Tor | 0.4.9.5 | [`1442ca4852283d6650dcad60bdb4e9167aceb495`](https://gitlab.torproject.org/tpo/core/tor/-/commit/1442ca4852283d6650dcad60bdb4e9167aceb495) |
+
+## Supported targets
+
+- Linux `amd64`, `386`, `arm64`, `arm`
+- Android `amd64`, `386`, `arm64`, `arm`
+- macOS `amd64`, `arm64`
+- iOS `amd64`, `arm64`
+- Windows `amd64`, `386`
+
+## Install
+
+Add the module and use it through [`bine`](https://github.com/cretz/bine):
+
+```bash
+go get github.com/alexballas/go-libtor
+go get github.com/cretz/bine/tor
 ```
 
-However to ensure a build consistency across all users of your project we recommend using **go mod**.
+The first build is expensive. `go-libtor` compiles a large vendored C codebase, so `go build -x` is useful if you want visible progress.
 
 ## Usage
 
-The `go-libtor` project does not contain a full Go API to interface Tor with, rather only the smallest building block to start up an embedded instance. The reason is because there is already a solid Go project out there ([github.com/cretz/bine](https://github.com/cretz/bine)) which focuses on interfacing.
-
-Using both projects in combination however is straightforward:
+`go-libtor` provides the embedded Tor process creator. `bine` provides the higher-level control API.
 
 ```go
 package main
@@ -55,151 +53,55 @@ import (
 	"os"
 	"time"
 
+	"github.com/alexballas/go-libtor"
 	"github.com/cretz/bine/tor"
-	"github.com/gen2brain/go-libtor"
 )
 
 func main() {
-	// Start tor with some defaults + elevated verbosity
 	fmt.Println("Starting and registering onion service, please wait a bit...")
-	t, err := tor.Start(nil, &tor.StartConf{ProcessCreator: libtor.Creator, DebugWriter: os.Stderr})
+
+	t, err := tor.Start(context.Background(), &tor.StartConf{
+		ProcessCreator: libtor.Creator,
+		DebugWriter:    os.Stderr,
+	})
 	if err != nil {
-		log.Panicf("Failed to start tor: %v", err)
+		log.Fatalf("start tor: %v", err)
 	}
 	defer t.Close()
 
-	// Wait at most a few minutes to publish the service
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	// Create an onion service to listen on any port but show as 80
-	onion, err := t.Listen(ctx, &tor.ListenConf{RemotePorts: []int{80}})
+	onion, err := t.Listen(ctx, &tor.ListenConf{
+		Version3:    true,
+		RemotePorts: []int{80},
+	})
 	if err != nil {
-		log.Panicf("Failed to create onion service: %v", err)
+		log.Fatalf("create onion service: %v", err)
 	}
 	defer onion.Close()
 
-	fmt.Printf("Please open a Tor capable browser and navigate to http://%v.onion\n", onion.ID)
+	fmt.Printf("Open http://%s.onion in a Tor-capable browser\n", onion.ID)
 
-	// Run a Hello-World HTTP service until terminated
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Hello, Tor!")
+		fmt.Fprintln(w, "Hello, Tor!")
 	})
-	http.Serve(onion, nil)
+
+	log.Fatal(http.Serve(onion, nil))
 }
 ```
 
-The above code will:
+## Build notes
 
- * Start up a new Tor process from within your statically linked binary
- * Register a new anonymous onion TCP endpoint for remote clients
- * Start an HTTP server using the Tor network as its transport layer
-
-```
-$ go run main.go
-
-Starting and registering onion service, please wait a bit...
-[...]
-Enabling network before waiting for publication
-[...]
-Waiting for publication
-[...]
-Please open a Tor capable browser and navigate to http://s7t3iy76h54cjacg.onion
-```
-
-![Demo](https://raw.githubusercontent.com/gen2brain/go-libtor/master/demo.png)
-
-Well, that was easy. With a few lines of Go code we've created a hidden TCP service inside the Tor network. The browser used to test the server with above was [Brave](https://brave.com/), which among others has built in experimental support for Tor.
-
-## Mobile devices
-
-The advantage of `go-libtor` starts to show when building to more exotic platforms, since it's composed of simple CGO Go files. As it doesn't require custom build steps or tooling, it plays nice with the Go ecosystem, `gomobile` included:
-
-Let's see how much effort would it be to deploy onto Android:
-
-```go
-package demo
-
-import (
-	"context"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"time"
-
-	"github.com/cretz/bine/tor"
-	"github.com/gen2brain/go-libtor"
-)
-
-// Run starts up an embedded Tor process, starts a hidden onion service on a new
-// goroutine and returns the onion address. We're cheating here and not caring
-// about actually cleaning up after ourselves.
-func Run(datadir string) string {
-	// Start tor with some defaults + elevated verbosity
-	fmt.Println("Starting and registering onion service, please wait a bit...")
-	t, err := tor.Start(nil, &tor.StartConf{ProcessCreator: libtor.Creator, DebugWriter: os.Stderr, DataDir: datadir})
-	if err != nil {
-		log.Panicf("Failed to start tor: %v", err)
-	}
-	// Wait at most a few minutes to publish the service
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	// Create an onion service to listen on any port but show as 80
-	onion, err := t.Listen(ctx, &tor.ListenConf{RemotePorts: []int{80}})
-	if err != nil {
-		log.Panicf("Failed to create onion service: %v", err)
-	}
-	fmt.Printf("Please open a Tor capable browser and navigate to http://%v.onion\n", onion.ID)
-
-	// Run a Hello-World HTTP service until terminated
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Hello, Tor! This is Android!!!")
-	})
-	go http.Serve(onion, nil)
-
-	return fmt.Sprintf("http://%v.onion", onion.ID)
-}
-```
-
-The above code does approximately the same thing as the one before, just in its own package with a trivial API since we want to make an Android archive, not an entire `.apk`. We can invoke `gomobile` to bind it:
-
-```
-$ gomobile bind -v -x .
-[...many logs, much wow...]
-$ ls -al demo*
--rw-r--r-- 1 karalabe 38976071 Jul 19 18:46 demo.aar
--rw-r--r-- 1 karalabe     6162 Jul 19 18:46 demo-sources.jar
-$ unzip -l demo.aar
-Archive:  demo.aar
-  Length      Date    Time    Name
----------  ---------- -----   ----
-      143  1980-00-00 00:00   AndroidManifest.xml
-       25  1980-00-00 00:00   proguard.txt
-    11044  1980-00-00 00:00   classes.jar
- 26102356  1980-00-00 00:00   jni/armeabi-v7a/libgojni.so
- 27085856  1980-00-00 00:00   jni/arm64-v8a/libgojni.so
- 26327236  1980-00-00 00:00   jni/x86/libgojni.so
- 27757968  1980-00-00 00:00   jni/x86_64/libgojni.so
-        0  1980-00-00 00:00   R.txt
-        0  1980-00-00 00:00   res/
----------                     -------
-107284628                     9 files
-```
-
-Explaining how to load an `.aar` into an Android project is beyond the scope of this article, but you can load the archive with Android Studio as a module and edit your Gradle build config to add it as a dependency. An overly crude app would just start the server and drop the onion URL into an Android label:
-
-![Android](https://raw.githubusercontent.com/gen2brain/go-libtor/master/demo.jpg)
-
-That's actually it! We've managed to get a Tor hidden service running from an Android phone and access it from another device through the Tor network, all through 40 lines of Go- and 3 lines of Java code.
+- OpenSSL 3 builds currently emit deprecation warnings from Tor 0.4.9.5. Those warnings are expected and do not block the build.
+- Linux builds in this tree are expected to work with the vendored OpenSSL 3 and libevent 2.2 line.
+- If you are embedding this in an app, let your application own shutdown behavior. Tor and your own listeners should be stopped explicitly on process termination.
 
 ## Credits
 
-This repository is a fork of [ipsn/go-libtor](https://github.com/ipsn/go-libtor) originaly maintained by Péter Szilágyi ([@karalabe](https://github.com/karalabe)), but authorship of all code contained inside belongs to the individual upstream projects.
+This repository started as a fork of [ipsn/go-libtor](https://github.com/ipsn/go-libtor), later maintained as [gen2brain/go-libtor](https://github.com/gen2brain/go-libtor). Credit for the vendored C code belongs to the Tor, OpenSSL, libevent, and zlib upstream projects.
 
-
-This repository also includes work done by ([berty](https://berty.tech/)) in order to support macOS and iOS builds.
+This tree also includes portability work originally contributed for macOS and iOS support.
 
 ## License
 

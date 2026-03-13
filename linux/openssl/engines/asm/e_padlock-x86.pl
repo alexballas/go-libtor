@@ -1,17 +1,17 @@
 #! /usr/bin/env perl
-# Copyright 2011-2018 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2011-2025 The OpenSSL Project Authors. All Rights Reserved.
 #
-# Licensed under the OpenSSL license (the "License").  You may not use
+# Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
 # in the file LICENSE in the source distribution or at
 # https://www.openssl.org/source/license.html
 
 
 # ====================================================================
-# Written by Andy Polyakov <appro@openssl.org> for the OpenSSL
+# Written by Andy Polyakov, @dot-asm, initially for use in the OpenSSL
 # project. The module is, however, dual licensed under OpenSSL and
 # CRYPTOGAMS licenses depending on where you obtain it. For further
-# details see http://www.openssl.org/~appro/cryptogams/.
+# details see https://github.com/dot-asm/cryptogams/.
 # ====================================================================
 
 # September 2011
@@ -42,8 +42,7 @@ $0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
 push(@INC,"${dir}","${dir}../../crypto/perlasm");
 require "x86asm.pl";
 
-$output=pop;
-open STDOUT,">$output";
+$output=pop and open STDOUT,">$output";
 
 &asm_init($ARGV[0]);
 
@@ -116,6 +115,8 @@ $chunk="ebx";
 &function_begin_B("padlock_key_bswap");
 	&mov	("edx",&wparam(0));
 	&mov	("ecx",&DWP(240,"edx"));
+	&inc	("ecx");
+	&shl	("ecx",2);
 &set_label("bswap_loop");
 	&mov	("eax",&DWP(0,"edx"));
 	&bswap	("eax");
@@ -611,7 +612,7 @@ my ($mode,$opcode) = @_;
 	&ret	();
 &function_end_B("padlock_sha512_blocks");
 
-&asciz	("VIA Padlock x86 module, CRYPTOGAMS by <appro\@openssl.org>");
+&asciz	("VIA Padlock x86 module, CRYPTOGAMS by <https://github.com/dot-asm>");
 &align	(16);
 
 &dataseg();
