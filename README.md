@@ -10,6 +10,8 @@ This repository is a maintained fork of `gen2brain/go-libtor`. The current modul
 github.com/alexballas/go-libtor
 ```
 
+Local maintenance notes for vendored-source patches live in [`PATCHES.md`](PATCHES.md).
+
 ## Bundled upstreams
 
 | Library | Version | Commit |
@@ -93,7 +95,7 @@ func main() {
 
 ## Build notes
 
-- OpenSSL 3 builds currently emit deprecation warnings from Tor 0.4.9.5. Those warnings are expected and do not block the build.
+- OpenSSL/Tor vendoring carries a small local patch set for release packaging and warning reduction. Review [`PATCHES.md`](PATCHES.md) when updating upstream source trees.
 - Linux builds in this tree are expected to work with the vendored OpenSSL 3 and libevent 2.2 line.
 - If you are embedding this in an app, let your application own shutdown behavior. Tor and your own listeners should be stopped explicitly on process termination.
 
