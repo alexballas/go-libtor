@@ -30,20 +30,17 @@
 # Auto generated headers
 /crypto/buildinf.h
 /include/crypto/*_conf.h
+!/include/crypto/bn_conf.h
+!/include/crypto/dso_conf.h
 /include/openssl/asn1.h
 /include/openssl/asn1t.h
 /include/openssl/bio.h
-/include/openssl/cmp.h
 /include/openssl/cms.h
 /include/openssl/comp.h
 /include/openssl/conf.h
-/include/openssl/configuration.h
-/include/openssl/crmf.h
 /include/openssl/crypto.h
 /include/openssl/ct.h
 /include/openssl/err.h
-/include/openssl/ess.h
-/include/openssl/fipskey.h
 /include/openssl/lhash.h
 /include/openssl/ocsp.h
 /include/openssl/opensslv.h
@@ -55,9 +52,7 @@
 /include/openssl/ui.h
 /include/openssl/x509.h
 /include/openssl/x509v3.h
-/include/openssl/x509_acert.h
 /include/openssl/x509_vfy.h
-/include/openssl/core_names.h
 
 # Auto generated parameter name files
 /crypto/params_idx.c
@@ -76,16 +71,6 @@ providers/common/der/der_wrap_gen.c
 providers/common/der/der_sm2_gen.c
 providers/common/der/der_ml_dsa_gen.c
 providers/common/der/der_hkdf_gen.c
-providers/common/include/prov/der_slh_dsa.h
-providers/common/include/prov/der_dsa.h
-providers/common/include/prov/der_ec.h
-providers/common/include/prov/der_ecx.h
-providers/common/include/prov/der_rsa.h
-providers/common/include/prov/der_digests.h
-providers/common/include/prov/der_wrap.h
-providers/common/include/prov/der_sm2.h
-providers/common/include/prov/der_ml_dsa.h
-providers/common/include/prov/der_hkdf.h
 providers/implementations/asymciphers/rsa_enc.c
 providers/implementations/asymciphers/sm2_enc.c
 providers/implementations/exchange/dh_exch.c
@@ -122,7 +107,6 @@ providers/implementations/keymgmt/mlx_kmgmt.c
 providers/implementations/signature/dsa_sig.c
 providers/implementations/signature/ecdsa_sig.c
 providers/implementations/keymgmt/ecx_kmgmt.c
-providers/implementations/keymgmt/lms_kmgmt.c
 providers/implementations/keymgmt/ml_dsa_kmgmt.c
 providers/implementations/keymgmt/ml_kem_kmgmt.c
 providers/implementations/keymgmt/mlx_kmgmt.c
@@ -136,7 +120,6 @@ providers/implementations/signature/sm2_sig.c
 providers/implementations/skeymgmt/generic.c
 providers/implementations/storemgmt/file_store_any2obj.c
 providers/implementations/storemgmt/file_store.c
-providers/implementations/storemgmt/winstore_store.c
 providers/implementations/ciphers/ciphercommon.c
 providers/implementations/ciphers/ciphercommon_ccm.c
 providers/implementations/ciphers/ciphercommon_gcm.c
@@ -144,7 +127,6 @@ providers/implementations/ciphers/cipher_chacha20_poly1305.c
 providers/implementations/digests/blake2_prov.c
 providers/implementations/digests/digestcommon.c
 providers/implementations/digests/sha3_prov.c
-providers/implementations/include/prov/blake2_params.inc
 providers/implementations/macs/cmac_prov.c
 providers/implementations/macs/gmac_prov.c
 providers/implementations/macs/hmac_prov.c
@@ -154,7 +136,6 @@ providers/implementations/macs/siphash_prov.c
 providers/implementations/rands/drbg_ctr.c
 providers/implementations/rands/drbg_hash.c
 providers/implementations/rands/drbg_hmac.c
-providers/implementations/rands/fips_crng_test.c
 providers/implementations/rands/seed_src.c
 providers/implementations/rands/seed_src_jitter.c
 providers/implementations/rands/test_rng.c
