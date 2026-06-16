@@ -1,5 +1,4 @@
 //go:build none
-// +build none
 
 package main
 
@@ -15,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,10 +186,7 @@ func parseVersionParts(raw string) ([]int, error) {
 }
 
 func compareVersionParts(a, b []int) int {
-	limit := len(a)
-	if len(b) > limit {
-		limit = len(b)
-	}
+	limit := max(len(b), len(a))
 	for i := 0; i < limit; i++ {
 		var ai, bi int
 		if i < len(a) {
@@ -223,12 +220,7 @@ func uniqueStrings(items []string) []string {
 }
 
 func containsString(items []string, want string) bool {
-	for _, item := range items {
-		if item == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(items, want)
 }
 
 func extractLibeventObjects(out string) []string {

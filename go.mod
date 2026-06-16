@@ -1,6 +1,6 @@
 module github.com/alexballas/go-libtor
 
-go 1.13
+go 1.25
 
 require (
 	github.com/cretz/bine v0.2.0
