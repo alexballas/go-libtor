@@ -999,8 +999,7 @@ func wrapOpenSSL(tgt string, lock *lockJson) (string, string, error) {
 		source := filepath.Join(tgtf, dep+".c")
 		if _, err := os.Stat(source); err == nil {
 			continue
-		}
-		if !os.IsNotExist(err) {
+		} else if !os.IsNotExist(err) {
 			return "", "", err
 		}
 		if _, err := os.Stat(filepath.Join(tgtf, dep+".c.in")); err == nil {
