@@ -88,8 +88,6 @@ renders these templates with `.StrVer` (the version detected from the upstream
 `./configure`), so they now use `{{.StrVer}}` and the compiled-in version stays
 in sync automatically. `config/tor/micro-revision.i` is still a static string
 and should be set to the abbreviated commit of the vendored Tor release.
-(`config/tor/orconfig.darwin64.h` is unused — the dispatcher includes
-`orconfig.macos64.h` for darwin — and is intentionally left as-is.)
 
 ## Checklist when updating Tor or OpenSSL
 

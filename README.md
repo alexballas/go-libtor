@@ -4,6 +4,8 @@
 
 `go-libtor` embeds Tor and its C dependencies directly into a Go build. The result is a self-contained Go package that can start an in-process Tor instance through CGO, without requiring a system Tor installation.
 
+> **Linux-only.** This fork supports Linux and Android targets only. macOS, iOS, and Windows support has been removed.
+
 This repository is a maintained fork of `gen2brain/go-libtor`. The current module path is:
 
 ```text
@@ -19,15 +21,14 @@ Local maintenance notes for vendored-source patches live in [`PATCHES.md`](PATCH
 | zlib | 1.3.2 | [`da607da739fa6047df13e66a2af6b8bec7c2a498`](https://github.com/madler/zlib/commit/da607da739fa6047df13e66a2af6b8bec7c2a498) |
 | libevent | 2.2.1-alpha-dev | [`fe9dc8f614db0520027e8e2adb95769193d4f0a3`](https://github.com/libevent/libevent/commit/fe9dc8f614db0520027e8e2adb95769193d4f0a3) |
 | OpenSSL | 3.6.3 | [`aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f`](https://github.com/openssl/openssl/commit/aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f) |
-| Tor | 0.4.9.8 | [`e170cdcfebd45f6d098e3d811e2b1e1d120df184`](https://gitlab.torproject.org/tpo/core/tor/-/commit/e170cdcfebd45f6d098e3d811e2b1e1d120df184) |
+| Tor | 0.4.9.9 | [`74b53bd1992da4eca7a89668d9a1a040faff7a73`](https://gitlab.torproject.org/tpo/core/tor/-/commit/74b53bd1992da4eca7a89668d9a1a040faff7a73) |
 
 ## Supported targets
 
 - Linux `amd64`, `386`, `arm64`, `arm`
 - Android `amd64`, `386`, `arm64`, `arm`
-- macOS `amd64`, `arm64`
-- iOS `amd64`, `arm64`
-- Windows `amd64`, `386`
+
+> This is a Linux-only fork. macOS, iOS, and Windows targets have been removed.
 
 ## Install
 
@@ -102,8 +103,6 @@ func main() {
 ## Credits
 
 This repository started as a fork of [ipsn/go-libtor](https://github.com/ipsn/go-libtor), later maintained as [gen2brain/go-libtor](https://github.com/gen2brain/go-libtor). Credit for the vendored C code belongs to the Tor, OpenSSL, libevent, and zlib upstream projects.
-
-This tree also includes portability work originally contributed for macOS and iOS support.
 
 ## License
 
