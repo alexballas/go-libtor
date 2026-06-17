@@ -76,7 +76,6 @@ func main() {
 	defer cancel()
 
 	onion, err := t.Listen(ctx, &tor.ListenConf{
-		Version3:    true,
 		RemotePorts: []int{80},
 	})
 	if err != nil {
