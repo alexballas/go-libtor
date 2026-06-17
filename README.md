@@ -32,11 +32,11 @@ Local maintenance notes for vendored-source patches live in [`PATCHES.md`](PATCH
 
 ## Install
 
-Add the module and use it through [`bine`](https://github.com/cretz/bine):
+Add the module and use it through [`bine`](https://github.com/alexballas/bine):
 
 ```bash
 go get github.com/alexballas/go-libtor
-go get github.com/cretz/bine/tor
+go get github.com/alexballas/bine/tor
 ```
 
 The first build is expensive. `go-libtor` compiles a large vendored C codebase, so `go build -x` is useful if you want visible progress.
@@ -57,7 +57,7 @@ import (
 	"time"
 
 	"github.com/alexballas/go-libtor"
-	"github.com/cretz/bine/tor"
+	"github.com/alexballas/bine/tor"
 )
 
 func main() {
