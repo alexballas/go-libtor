@@ -21,7 +21,7 @@ Local maintenance notes for vendored-source patches live in [`PATCHES.md`](PATCH
 | zlib | 1.3.2 | [`da607da739fa6047df13e66a2af6b8bec7c2a498`](https://github.com/madler/zlib/commit/da607da739fa6047df13e66a2af6b8bec7c2a498) |
 | libevent | 2.2.1-alpha-dev | [`fe9dc8f614db0520027e8e2adb95769193d4f0a3`](https://github.com/libevent/libevent/commit/fe9dc8f614db0520027e8e2adb95769193d4f0a3) |
 | OpenSSL | 3.6.3 | [`aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f`](https://github.com/openssl/openssl/commit/aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f) |
-| Tor | 0.4.9.9 | [`74b53bd1992da4eca7a89668d9a1a040faff7a73`](https://gitlab.torproject.org/tpo/core/tor/-/commit/74b53bd1992da4eca7a89668d9a1a040faff7a73) |
+| Tor | 0.4.9.11 | [`f3d28b2e0978ca075ec324834bec077673478ded`](https://gitlab.torproject.org/tpo/core/tor/-/commit/f3d28b2e0978ca075ec324834bec077673478ded) |
 
 ## Supported targets
 
