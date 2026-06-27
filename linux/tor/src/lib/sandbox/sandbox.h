@@ -15,11 +15,11 @@
 #include "orconfig.h"
 #include "lib/cc/torint.h"
 
-#ifndef SYS_SECCOMP
 #ifdef HAVE_SIGNAL_H
 #include <signal.h>
 #endif
 
+#ifndef SYS_SECCOMP
 /**
  * Used by SIGSYS signal handler to check if the signal was issued due to a
  * seccomp2 filter violation.
